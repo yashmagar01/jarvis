@@ -3,17 +3,14 @@ import io from 'socket.io-client';
 
 import Visualizer from './components/Visualizer';
 import TopAudioBar from './components/TopAudioBar';
-import CadWindow from './components/CadWindow';
 import BrowserWindow from './components/BrowserWindow';
 import ChatModule from './components/ChatModule';
 import ToolsModule from './components/ToolsModule';
-import { Mic, MicOff, Settings, X, Minus, Power, Video, VideoOff, Layout, Hand, Printer, Clock } from 'lucide-react';
+import { Mic, MicOff, Settings, X, Minus, Power, Video, VideoOff, Layout, Hand, Clock } from 'lucide-react';
 import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 // MemoryPrompt removed - memory is now actively saved to project
 import ConfirmationPopup from './components/ConfirmationPopup';
 import AuthLock from './components/AuthLock';
-import KasaWindow from './components/KasaWindow';
-import PrinterWindow from './components/PrinterWindow';
 import SettingsWindow from './components/SettingsWindow';
 
 
@@ -55,16 +52,8 @@ function App() {
     const [browserData, setBrowserData] = useState({ image: null, logs: [] });
     // showMemoryPrompt removed - memory is now actively saved to project
     const [confirmationRequest, setConfirmationRequest] = useState(null); // { id, tool, args }
-    const [kasaDevices, setKasaDevices] = useState([]);
-    const [showKasaWindow, setShowKasaWindow] = useState(false);
-    const [showPrinterWindow, setShowPrinterWindow] = useState(false);
-    const [showCadWindow, setShowCadWindow] = useState(false);
     const [showBrowserWindow, setShowBrowserWindow] = useState(false);
 
-    // Printing workflow status (for top toolbar display)
-    const [slicingStatus, setSlicingStatus] = useState({ active: false, percent: 0, message: '' });
-    const [activePrintStatus, setActivePrintStatus] = useState(null); // {printer, progress_percent, time_elapsed, state}
-    const [printerCount, setPrinterCount] = useState(0); // Count of connected printers
     const [currentTime, setCurrentTime] = useState(new Date()); // Live clock
 
 
@@ -294,10 +283,6 @@ function App() {
         if (isConnected && isAuthenticated && socketConnected && micDevices.length > 0 && !hasAutoConnectedRef.current) {
             hasAutoConnectedRef.current = true;
 
-            // Trigger Kasa and Printer Discovery
-            socket.emit('discover_kasa');
-            socket.emit('discover_printers');
-
             // Connect to model with small delay for socket stability
             const timer = setTimeout(() => {
                 const index = micDevices.findIndex(d => d.deviceId === selectedMicId);
@@ -372,55 +357,6 @@ function App() {
             console.error("Socket Error:", data);
             addMessage('System', `Error: ${data.msg}`);
         });
-        socket.on('cad_data', (data) => {
-            console.log("Received CAD Data:", data);
-            setCadData(data);
-            setCadThoughts(''); // Clear thoughts when generation complete
-            setShowCadWindow(true); // Open window when data arrives
-            // Auto-show the window if it's hidden, clamped to viewport
-            if (!elementPositions.cad) {
-                const size = { w: 400, h: 400 };
-                const clamped = clampToViewport({ x: window.innerWidth / 2 + 150, y: window.innerHeight / 2 }, size);
-                setElementPositions(prev => ({
-                    ...prev,
-                    cad: clamped
-                }));
-            }
-        });
-        socket.on('cad_status', (data) => {
-            console.log("Received CAD Status:", data);
-            // Extract retry info from extended payload
-            if (data.attempt) {
-                setCadRetryInfo({
-                    attempt: data.attempt,
-                    maxAttempts: data.max_attempts || 3,
-                    error: data.error
-                });
-            }
-            if (data.status === 'generating' || data.status === 'retrying') {
-                setCadData({ format: 'loading' });
-                setShowCadWindow(true);
-                if (data.status === 'generating' && data.attempt === 1) {
-                    setCadThoughts(''); // Clear previous thoughts for new generation
-                }
-                // Auto-show the window, clamped to viewport
-                if (!elementPositions.cad) {
-                    const size = { w: 400, h: 400 };
-                    const clamped = clampToViewport({ x: window.innerWidth / 2 + 150, y: window.innerHeight / 2 }, size);
-                    setElementPositions(prev => ({
-                        ...prev,
-                        cad: clamped
-                    }));
-                }
-            } else if (data.status === 'failed') {
-                // Keep loading state but show error
-                setCadData({ format: 'loading' });
-            }
-        });
-        socket.on('cad_thought', (data) => {
-            // Append streaming thought text
-            setCadThoughts(prev => prev + data.text);
-        });
         socket.on('browser_frame', (data) => {
             setBrowserData(prev => ({
                 image: data.image,
@@ -470,74 +406,10 @@ function App() {
             setConfirmationRequest(data);
         });
 
-        // Handle Print Window Request (from CadWindow)
-        socket.on('request_print_window', () => {
-            setShowPrinterWindow(true);
-            const size = { w: 380, h: 380 };
-            const clamped = clampToViewport({ x: window.innerWidth / 2, y: window.innerHeight / 2 }, size);
-            setElementPositions(prev => ({
-                ...prev,
-                printer: clamped
-            }));
-        });
-
-        // Kasa Devices
-        socket.on('kasa_devices', (devices) => {
-            console.log("Kasa Devices:", devices);
-            setKasaDevices(devices);
-        });
-
-        socket.on('kasa_update', (data) => {
-            setKasaDevices(prev => prev.map(d => {
-                if (d.ip === data.ip) {
-                    // Update only fields that are not null/undefined
-                    return {
-                        ...d,
-                        is_on: data.is_on !== null ? data.is_on : d.is_on,
-                        brightness: data.brightness !== null ? data.brightness : d.brightness
-                    };
-                }
-                return d;
-            }));
-        });
-
         socket.on('project_update', (data) => {
             console.log("Project Update:", data.project);
             setCurrentProject(data.project);
             addMessage('System', `Switched to project: ${data.project}`);
-        });
-
-        // Track printer count for toolbar display
-        socket.on('printer_list', (list) => {
-            console.log('[PRINTERS] Count:', list.length);
-            setPrinterCount(list.length);
-        });
-
-        // Slicing progress for top toolbar
-        socket.on('slicing_progress', (data) => {
-            console.log('[SLICING] Progress:', data);
-            setSlicingStatus({
-                active: data.percent < 100,
-                percent: data.percent,
-                message: data.message
-            });
-        });
-
-        // Print status for top toolbar - track active prints
-        socket.on('print_status_update', (data) => {
-            console.log('[PRINT STATUS]', data);
-            // Only show in toolbar if actively printing
-            if (data.state && data.state.toLowerCase().includes('print')) {
-                setActivePrintStatus({
-                    printer: data.printer,
-                    progress_percent: data.progress_percent,
-                    time_elapsed: data.time_elapsed,
-                    state: data.state
-                });
-            } else if (data.state && (data.state.toLowerCase() === 'idle' || data.state.toLowerCase() === 'standby' || data.state.toLowerCase() === 'complete')) {
-                // Clear if print finished or idle
-                setActivePrintStatus(null);
-            }
         });
 
 

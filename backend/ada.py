@@ -83,22 +83,54 @@ list_projects_tool = {
     }
 }
 
+# Memory Tools
+remember_fact_tool = {
+    "name": "remember_fact",
+    "description": "Store an important fact or preference about the user for long-term memory. Use this when the user explicitly wants you to remember something.",
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "fact": {"type": "STRING", "description": "The fact or preference to remember."}
+        },
+        "required": ["fact"]
+    }
+}
 
+recall_memories_tool = {
+    "name": "recall_memories",
+    "description": "Search long-term memory for relevant past information about a topic.",
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "query": {"type": "STRING", "description": "What to search for in memory."}
+        },
+        "required": ["query"]
+    }
+}
 
+tools = [{'google_search': {}}, {"function_declarations": [run_web_agent, create_project_tool, switch_project_tool, list_projects_tool, remember_fact_tool, recall_memories_tool] + tools_list[0]['function_declarations'][1:]}]
 
-tools = [{'google_search': {}}, {"function_declarations": [run_web_agent, create_project_tool, switch_project_tool, list_projects_tool] + tools_list[0]['function_declarations'][1:]}]
-
-# --- CONFIG UPDATE: Enabled Transcription ---
+# --- CONFIG: Jarvis Mentor Persona ---
 config = types.LiveConnectConfig(
     response_modalities=["AUDIO"],
-    # We switch these from [] to {} to enable them with default settings
     output_audio_transcription={}, 
     input_audio_transcription={},
-    system_instruction="Your name is Ada, which stands for Advanced Design Assistant. "
-        "You have a witty and charming personality. "
-        "Your creator is Naz, and you address him as 'Sir'. "
-        "When answering, respond using complete and concise sentences to keep a quick pacing and keep the conversation flowing. "
-        "You have a fun personality.",
+    system_instruction="""
+    You are JARVIS, a high-performance personal assistant for Yash, a Computer Engineering diploma student in India.
+    
+    YOUR CORE PROTOCOL:
+    1.  **Identity:** You are practical, resource-conscious, and logic-driven. You are not a generic AI; you are a mentor.
+    2.  **User Context:** Yash comes from a humble background and is ambitious about building wealth through skills. He prefers practical, applied knowledge over abstract theory.
+    3.  **Domain Expertise:** You are an expert in Full Stack Development (Django, React), System Design, and Data Structures.
+    
+    COMMUNICATION RULES:
+    1.  **No Spoon-Feeding:** When Yash asks a technical doubt, DO NOT just dump the code. First, ask a counter-question to check his understanding. Guide him to the answer.
+    2.  **Analogies over Jargon:** Explain complex engineering concepts using weird but logical real-world analogies (e.g., explain API rate limiting like a college canteen queue).
+    3.  **Conciseness:** Be brief. Yash values time. Get to the point.
+    4.  **Action-Oriented:** Always end with a "Next Step" or a challenge for him to implement.
+    
+    If Yash asks about 3D printing or CAD, remind him that those modules have been purged to save resources for higher-priority computing tasks.
+    """,
     tools=tools,
     speech_config=types.SpeechConfig(
         voice_config=types.VoiceConfig(
@@ -112,6 +144,7 @@ config = types.LiveConnectConfig(
 pya = pyaudio.PyAudio()
 
 from web_agent import WebAgent
+from memory_agent import MemoryAgent
 
 class AudioLoop:
     def __init__(self, video_mode=DEFAULT_MODE, on_audio_data=None, on_video_frame=None, on_web_data=None, on_transcription=None, on_tool_confirmation=None, on_project_update=None, on_error=None, input_device_index=None, input_device_name=None, output_device_index=None):
@@ -144,6 +177,7 @@ class AudioLoop:
         self.session = None
         
         self.web_agent = WebAgent()
+        self.memory_agent = MemoryAgent()
 
         self.send_text_task = None
         self.stop_event = asyncio.Event()
@@ -544,7 +578,7 @@ class AudioLoop:
                         print("The tool was called")
                         function_responses = []
                         for fc in response.tool_call.function_calls:
-                            if fc.name in ["run_web_agent", "write_file", "read_directory", "read_file", "create_project", "switch_project", "list_projects", "list_smart_devices", "control_light"]:
+                            if fc.name in ["run_web_agent", "write_file", "read_directory", "read_file", "create_project", "switch_project", "list_projects", "remember_fact", "recall_memories"]:
                                 prompt = fc.args.get("prompt", "") # Prompt is not present for all tools
                                 
                                 # Check Permissions (Default to True if not set)
@@ -691,129 +725,28 @@ class AudioLoop:
                                     )
                                     function_responses.append(function_response)
 
-                                elif fc.name == "list_smart_devices":
-                                    print(f"[ADA DEBUG] [TOOL] Tool Call: 'list_smart_devices'")
-                                    # Use cached devices directly for speed
-                                    # devices_dict is {ip: SmartDevice}
-                                    
-                                    dev_summaries = []
-                                    frontend_list = []
-                                    
-                                    for ip, d in self.kasa_agent.devices.items():
-                                        dev_type = "unknown"
-                                        if d.is_bulb: dev_type = "bulb"
-                                        elif d.is_plug: dev_type = "plug"
-                                        elif d.is_strip: dev_type = "strip"
-                                        elif d.is_dimmer: dev_type = "dimmer"
-                                        
-                                        # Format for Model
-                                        info = f"{d.alias} (IP: {ip}, Type: {dev_type})"
-                                        if d.is_on:
-                                            info += " [ON]"
-                                        else:
-                                            info += " [OFF]"
-                                        dev_summaries.append(info)
-                                        
-                                        # Format for Frontend
-                                        frontend_list.append({
-                                            "ip": ip,
-                                            "alias": d.alias,
-                                            "model": d.model,
-                                            "type": dev_type,
-                                            "is_on": d.is_on,
-                                            "brightness": d.brightness if d.is_bulb or d.is_dimmer else None,
-                                            "hsv": d.hsv if d.is_bulb and d.is_color else None,
-                                            "has_color": d.is_color if d.is_bulb else False,
-                                            "has_brightness": d.is_dimmable if d.is_bulb or d.is_dimmer else False
-                                        })
-                                    
-                                    result_str = "No devices found in cache."
-                                    if dev_summaries:
-                                        result_str = "Found Devices (Cached):\n" + "\n".join(dev_summaries)
-                                    
-                                    # Trigger frontend update
-                                    if self.on_device_update:
-                                        self.on_device_update(frontend_list)
-
+                                elif fc.name == "remember_fact":
+                                    fact = fc.args["fact"]
+                                    print(f"[JARVIS] [TOOL] Tool Call: 'remember_fact' fact='{fact[:50]}...'")
+                                    result = await self.memory_agent.add_memory(fact)
+                                    if result["success"]:
+                                        result_msg = f"I've stored that in my long-term memory."
+                                    else:
+                                        result_msg = f"Memory storage unavailable: {result.get('error', 'Unknown error')}"
                                     function_response = types.FunctionResponse(
-                                        id=fc.id, name=fc.name, response={"result": result_str}
+                                        id=fc.id, name=fc.name, response={"result": result_msg}
                                     )
                                     function_responses.append(function_response)
 
-                                elif fc.name == "control_light":
-                                    target = fc.args["target"]
-                                    action = fc.args["action"]
-                                    brightness = fc.args.get("brightness")
-                                    color = fc.args.get("color")
-                                    
-                                    print(f"[ADA DEBUG] [TOOL] Tool Call: 'control_light' Target='{target}' Action='{action}'")
-                                    
-                                    result_msg = f"Action '{action}' on '{target}' failed."
-                                    success = False
-                                    
-                                    if action == "turn_on":
-                                        success = await self.kasa_agent.turn_on(target)
-                                        if success:
-                                            result_msg = f"Turned ON '{target}'."
-                                    elif action == "turn_off":
-                                        success = await self.kasa_agent.turn_off(target)
-                                        if success:
-                                            result_msg = f"Turned OFF '{target}'."
-                                    elif action == "set":
-                                        success = True
-                                        result_msg = f"Updated '{target}':"
-                                    
-                                    # Apply extra attributes if 'set' or if we just turned it on and want to set them too
-                                    if success or action == "set":
-                                        if brightness is not None:
-                                            sb = await self.kasa_agent.set_brightness(target, brightness)
-                                            if sb:
-                                                result_msg += f" Set brightness to {brightness}."
-                                        if color is not None:
-                                            sc = await self.kasa_agent.set_color(target, color)
-                                            if sc:
-                                                result_msg += f" Set color to {color}."
-
-                                    # Notify Frontend of State Change
-                                    if success:
-                                        # We don't need full discovery, just refresh known state or push update
-                                        # But for simplicity, let's get the standard list representation
-                                        # KasaAgent updates its internal state on control, so we can rebuild the list
-                                        
-                                        # Quick rebuild of list from internal dict
-                                        updated_list = []
-                                        for ip, dev in self.kasa_agent.devices.items():
-                                            # We need to ensure we have the correct dict structure expected by frontend
-                                            # We duplicate logic from KasaAgent.discover_devices a bit, but that's okay for now or we can add a helper
-                                            # Ideally KasaAgent has a 'get_devices_list()' method.
-                                            # Use the cached objects in self.kasa_agent.devices
-                                            
-                                            dev_type = "unknown"
-                                            if dev.is_bulb: dev_type = "bulb"
-                                            elif dev.is_plug: dev_type = "plug"
-                                            elif dev.is_strip: dev_type = "strip"
-                                            elif dev.is_dimmer: dev_type = "dimmer"
-
-                                            d_info = {
-                                                "ip": ip,
-                                                "alias": dev.alias,
-                                                "model": dev.model,
-                                                "type": dev_type,
-                                                "is_on": dev.is_on,
-                                                "brightness": dev.brightness if dev.is_bulb or dev.is_dimmer else None,
-                                                "hsv": dev.hsv if dev.is_bulb and dev.is_color else None,
-                                                "has_color": dev.is_color if dev.is_bulb else False,
-                                                "has_brightness": dev.is_dimmable if dev.is_bulb or dev.is_dimmer else False
-                                            }
-                                            updated_list.append(d_info)
-                                            
-                                        if self.on_device_update:
-                                            self.on_device_update(updated_list)
+                                elif fc.name == "recall_memories":
+                                    query = fc.args["query"]
+                                    print(f"[JARVIS] [TOOL] Tool Call: 'recall_memories' query='{query}'")
+                                    memories = await self.memory_agent.search_memories(query)
+                                    if memories:
+                                        memory_texts = [m["content"] for m in memories]
+                                        result_msg = f"Found {len(memories)} relevant memories:\n" + "\n".join(f"- {m}" for m in memory_texts)
                                     else:
-                                        # Report Error
-                                        if self.on_error:
-                                            self.on_error(result_msg)
-
+                                        result_msg = "No relevant memories found."
                                     function_response = types.FunctionResponse(
                                         id=fc.id, name=fc.name, response={"result": result_msg}
                                     )

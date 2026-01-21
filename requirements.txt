@@ -15,3 +15,5 @@ playwright
 python-dotenv
 # Face & Hand tracking
 mediapipe
+# Long-term Memory
+supermemory
