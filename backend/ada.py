@@ -83,45 +83,10 @@ list_projects_tool = {
     }
 }
 
-list_smart_devices_tool = {
-    "name": "list_smart_devices",
-    "description": "Lists all available smart home devices (lights, plugs, etc.) on the network.",
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {},
-    }
-}
-
-control_light_tool = {
-    "name": "control_light",
-    "description": "Controls a smart light device.",
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "target": {
-                "type": "STRING",
-                "description": "The IP address of the device to control. Always prefer the IP address over the alias for reliability."
-            },
-            "action": {
-                "type": "STRING",
-                "description": "The action to perform: 'turn_on', 'turn_off', or 'set'."
-            },
-            "brightness": {
-                "type": "INTEGER",
-                "description": "Optional brightness level (0-100)."
-            },
-            "color": {
-                "type": "STRING",
-                "description": "Optional color name (e.g., 'red', 'cool white') or 'warm'."
-            }
-        },
-        "required": ["target", "action"]
-    }
-}
 
 
 
-tools = [{'google_search': {}}, {"function_declarations": [run_web_agent, create_project_tool, switch_project_tool, list_projects_tool, list_smart_devices_tool, control_light_tool] + tools_list[0]['function_declarations'][1:]}]
+tools = [{'google_search': {}}, {"function_declarations": [run_web_agent, create_project_tool, switch_project_tool, list_projects_tool] + tools_list[0]['function_declarations'][1:]}]
 
 # --- CONFIG UPDATE: Enabled Transcription ---
 config = types.LiveConnectConfig(
@@ -147,10 +112,9 @@ config = types.LiveConnectConfig(
 pya = pyaudio.PyAudio()
 
 from web_agent import WebAgent
-from kasa_agent import KasaAgent
 
 class AudioLoop:
-    def __init__(self, video_mode=DEFAULT_MODE, on_audio_data=None, on_video_frame=None, on_web_data=None, on_transcription=None, on_tool_confirmation=None, on_project_update=None, on_device_update=None, on_error=None, input_device_index=None, input_device_name=None, output_device_index=None, kasa_agent=None):
+    def __init__(self, video_mode=DEFAULT_MODE, on_audio_data=None, on_video_frame=None, on_web_data=None, on_transcription=None, on_tool_confirmation=None, on_project_update=None, on_error=None, input_device_index=None, input_device_name=None, output_device_index=None):
         self.video_mode = video_mode
         self.on_audio_data = on_audio_data
         self.on_video_frame = on_video_frame
@@ -158,7 +122,6 @@ class AudioLoop:
         self.on_transcription = on_transcription
         self.on_tool_confirmation = on_tool_confirmation 
         self.on_project_update = on_project_update
-        self.on_device_update = on_device_update
         self.on_error = on_error
         self.input_device_index = input_device_index
         self.input_device_name = input_device_name
@@ -181,7 +144,6 @@ class AudioLoop:
         self.session = None
         
         self.web_agent = WebAgent()
-        self.kasa_agent = kasa_agent if kasa_agent else KasaAgent()
 
         self.send_text_task = None
         self.stop_event = asyncio.Event()

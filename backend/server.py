@@ -24,7 +24,6 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import ada
 from authenticator import FaceAuthenticator
-from kasa_agent import KasaAgent
 
 # Create a Socket.IO server
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
@@ -54,7 +53,6 @@ signal.signal(signal.SIGTERM, signal_handler)
 audio_loop = None
 loop_task = None
 authenticator = None
-kasa_agent = KasaAgent()
 SETTINGS_FILE = "settings.json"
 
 DEFAULT_SETTINGS = {
@@ -68,7 +66,6 @@ DEFAULT_SETTINGS = {
         "switch_project": True,
         "list_projects": True
     },
-    "kasa_devices": [], # List of {ip, alias, model}
     "camera_flipped": False # Invert cursor horizontal direction
 }
 
@@ -103,7 +100,6 @@ def save_settings():
 load_settings()
 
 authenticator = None
-kasa_agent = KasaAgent(known_devices=SETTINGS.get("kasa_devices"))
 # tool_permissions is now SETTINGS["tool_permissions"]
 
 @app.on_event("startup")
@@ -119,8 +115,6 @@ async def startup_event():
     except Exception as e:
         print(f"[SERVER DEBUG] Error checking loop: {e}")
 
-    print("[SERVER] Startup: Initializing Kasa Agent...")
-    await kasa_agent.initialize()
 
 @app.get("/status")
 async def status():
@@ -232,12 +226,6 @@ async def start_audio(sid, data=None):
         print(f"Sending Project Update: {project_name}")
         asyncio.create_task(sio.emit('project_update', {'project': project_name}))
 
-    # Callback to send Device Update to frontend
-    def on_device_update(devices):
-        # devices is a list of dicts
-        print(f"Sending Kasa Device Update: {len(devices)} devices")
-        asyncio.create_task(sio.emit('kasa_devices', devices))
-
     # Callback to send Error to frontend
     def on_error(msg):
         print(f"Sending Error to frontend: {msg}")
@@ -253,12 +241,10 @@ async def start_audio(sid, data=None):
             on_transcription=on_transcription,
             on_tool_confirmation=on_tool_confirmation,
             on_project_update=on_project_update,
-            on_device_update=on_device_update,
             on_error=on_error,
 
             input_device_index=device_index,
-            input_device_name=device_name,
-            kasa_agent=kasa_agent
+            input_device_name=device_name
         )
         print("AudioLoop initialized successfully.")
 
@@ -483,36 +469,6 @@ async def upload_memory(sid, data):
         await sio.emit('error', {'msg': f"Failed to upload memory: {str(e)}"})
 
 @sio.event
-async def discover_kasa(sid):
-    print(f"Received discover_kasa request")
-    try:
-        devices = await kasa_agent.discover_devices()
-        await sio.emit('kasa_devices', devices)
-        await sio.emit('status', {'msg': f"Found {len(devices)} Kasa devices"})
-        
-        # Save to settings
-        # devices is a list of full device info dicts. minimizing for storage.
-        saved_devices = []
-        for d in devices:
-            saved_devices.append({
-                "ip": d["ip"],
-                "alias": d["alias"],
-                "model": d["model"]
-            })
-        
-        # Merge with existing to preserve any manual overrides? 
-        # For now, just overwrite with latest scan result + previously known if we want to be fancy,
-        # but user asked for "Any new devices that are scanned are added there".
-        # A simple full persistence of current state is safest.
-        SETTINGS["kasa_devices"] = saved_devices
-        save_settings()
-        print(f"[SERVER] Saved {len(saved_devices)} Kasa devices to settings.")
-        
-    except Exception as e:
-        print(f"Error discovering kasa: {e}")
-        await sio.emit('error', {'msg': f"Kasa Discovery Failed: {str(e)}"})
-
-@sio.event
 async def prompt_web_agent(sid, data):
     # data: { prompt: "find xyz" }
     prompt = data.get('prompt')
@@ -524,61 +480,12 @@ async def prompt_web_agent(sid, data):
 
     try:
         await sio.emit('status', {'msg': 'Web Agent running...'})
-        
-        # We assume web_agent has a run method or similar.
-        # This might block the loop if not strictly async or offloaded.
-        # Ideally web_agent.run is async.
-        # And it should emit 'browser_snap' and logs automatically via hooks if setup.
-        
-        # We might need to launch this as a task if it's long running?
-        # asyncio.create_task(audio_loop.web_agent.run(prompt))
-        # But we want to catch errors here.
-        
-        # Based on typical agent design, run() is the entry point.
         await audio_loop.web_agent.run(prompt)
-        
         await sio.emit('status', {'msg': 'Web Agent finished'})
         
     except Exception as e:
         print(f"Error running Web Agent: {e}")
         await sio.emit('error', {'msg': f"Web Agent Error: {str(e)}"})
-
-@sio.event
-async def control_kasa(sid, data):
-    # data: { ip, action: "on"|"off"|"brightness"|"color", value: ... }
-    ip = data.get('ip')
-    action = data.get('action')
-    print(f"Kasa Control: {ip} -> {action}")
-    
-    try:
-        success = False
-        if action == "on":
-            success = await kasa_agent.turn_on(ip)
-        elif action == "off":
-            success = await kasa_agent.turn_off(ip)
-        elif action == "brightness":
-            val = data.get('value')
-            success = await kasa_agent.set_brightness(ip, val)
-        elif action == "color":
-            # value is {h, s, v} - convert to tuple for set_color
-            h = data.get('value', {}).get('h', 0)
-            s = data.get('value', {}).get('s', 100)
-            v = data.get('value', {}).get('v', 100)
-            success = await kasa_agent.set_color(ip, (h, s, v))
-        
-        if success:
-            await sio.emit('kasa_update', {
-                'ip': ip,
-                'is_on': True if action == "on" else (False if action == "off" else None),
-                'brightness': data.get('value') if action == "brightness" else None,
-            })
- 
-        else:
-             await sio.emit('error', {'msg': f"Failed to control device {ip}"})
-
-    except Exception as e:
-         print(f"Error controlling kasa: {e}")
-         await sio.emit('error', {'msg': f"Kasa Control Error: {str(e)}"})
 
 @sio.event
 async def get_settings(sid):

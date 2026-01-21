@@ -11,8 +11,6 @@ pillow
 mss
 # Browser Automation
 playwright
-# Smart Home
-python-kasa
 # Utilities
 python-dotenv
 # Face & Hand tracking
