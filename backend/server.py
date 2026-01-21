@@ -60,7 +60,6 @@ SETTINGS_FILE = "settings.json"
 DEFAULT_SETTINGS = {
     "face_auth_enabled": False, # Default OFF as requested
     "tool_permissions": {
-        "generate_cad": True,
         "run_web_agent": True,
         "write_file": True,
         "read_directory": True,
@@ -69,7 +68,6 @@ DEFAULT_SETTINGS = {
         "switch_project": True,
         "list_projects": True
     },
-    "printers": [], # List of {host, port, name, type}
     "kasa_devices": [], # List of {ip, alias, model}
     "camera_flipped": False # Invert cursor horizontal direction
 }
@@ -213,12 +211,6 @@ async def start_audio(sid, data=None):
         # This is high frequency, so we might want to downsample or batch if it's too much
         asyncio.create_task(sio.emit('audio_data', {'data': list(data_bytes)}))
 
-    # Callback to send CAL data to frontend
-    def on_cad_data(data):
-        info = f"{len(data.get('vertices', []))} vertices" if 'vertices' in data else f"{len(data.get('data', ''))} bytes (STL)"
-        print(f"Sending CAD data to frontend: {info}")
-        asyncio.create_task(sio.emit('cad_data', data))
-
     # Callback to send Browser data to frontend
     def on_web_data(data):
         print(f"Sending Browser data to frontend: {len(data.get('log', ''))} chars logs")
@@ -234,23 +226,6 @@ async def start_audio(sid, data=None):
         # data = {"id": "uuid", "tool": "tool_name", "args": {...}}
         print(f"Requesting confirmation for tool: {data.get('tool')}")
         asyncio.create_task(sio.emit('tool_confirmation_request', data))
-
-    # Callback to send CAD status to frontend
-    def on_cad_status(status):
-        # status can be: 
-        # - a string like "generating" (from ada.py handle_cad_request)
-        # - a dict with {status, attempt, max_attempts, error} (from CadAgent)
-        if isinstance(status, dict):
-            print(f"Sending CAD Status: {status.get('status')} (attempt {status.get('attempt')}/{status.get('max_attempts')})")
-            asyncio.create_task(sio.emit('cad_status', status))
-        else:
-            # Legacy: simple string
-            print(f"Sending CAD Status: {status}")
-            asyncio.create_task(sio.emit('cad_status', {'status': status}))
-
-    # Callback to send CAD thoughts to frontend (streaming)
-    def on_cad_thought(thought_text):
-        asyncio.create_task(sio.emit('cad_thought', {'text': thought_text}))
 
     # Callback to send Project Update to frontend
     def on_project_update(project_name):
@@ -268,18 +243,15 @@ async def start_audio(sid, data=None):
         print(f"Sending Error to frontend: {msg}")
         asyncio.create_task(sio.emit('error', {'msg': msg}))
 
-    # Initialize ADA
+    # Initialize Jarvis
     try:
         print(f"Initializing AudioLoop with device_index={device_index}")
         audio_loop = ada.AudioLoop(
             video_mode="none", 
             on_audio_data=on_audio_data,
-            on_cad_data=on_cad_data,
             on_web_data=on_web_data,
             on_transcription=on_transcription,
             on_tool_confirmation=on_tool_confirmation,
-            on_cad_status=on_cad_status,
-            on_cad_thought=on_cad_thought,
             on_project_update=on_project_update,
             on_device_update=on_device_update,
             on_error=on_error,
@@ -313,64 +285,16 @@ async def start_audio(sid, data=None):
         
         loop_task.add_done_callback(handle_loop_exit)
         
-        print("Emitting 'A.D.A Started'")
-        await sio.emit('status', {'msg': 'A.D.A Started'})
-
-        # Load saved printers
-        saved_printers = SETTINGS.get("printers", [])
-        if saved_printers and audio_loop.printer_agent:
-            print(f"[SERVER] Loading {len(saved_printers)} saved printers...")
-            for p in saved_printers:
-                audio_loop.printer_agent.add_printer_manually(
-                    name=p.get("name", p["host"]),
-                    host=p["host"],
-                    port=p.get("port", 80),
-                    printer_type=p.get("type", "moonraker"),
-                    camera_url=p.get("camera_url")
-                )
-        
-        # Start Printer Monitor
-        asyncio.create_task(monitor_printers_loop())
+        print("Emitting 'Jarvis Started'")
+        await sio.emit('status', {'msg': 'Jarvis Started'})
         
     except Exception as e:
-        print(f"CRITICAL ERROR STARTING ADA: {e}")
+        print(f"CRITICAL ERROR STARTING JARVIS: {e}")
         import traceback
         traceback.print_exc()
         await sio.emit('error', {'msg': f"Failed to start: {str(e)}"})
         audio_loop = None # Ensure we can try again
 
-
-async def monitor_printers_loop():
-    """Background task to query printer status periodically."""
-    print("[SERVER] Starting Printer Monitor Loop")
-    while audio_loop and audio_loop.printer_agent:
-        try:
-            agent = audio_loop.printer_agent
-            if not agent.printers:
-                await asyncio.sleep(5)
-                continue
-                
-            tasks = []
-            for host, printer in agent.printers.items():
-                if printer.printer_type.value != "unknown":
-                    tasks.append(agent.get_print_status(host))
-            
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for res in results:
-                    if isinstance(res, Exception):
-                        pass # Ignore errors for now
-                    elif res:
-                        # res is PrintStatus object
-                        await sio.emit('print_status_update', res.to_dict())
-                        
-        except asyncio.CancelledError:
-            print("[SERVER] Printer Monitor Cancelled")
-            break
-        except Exception as e:
-            print(f"[SERVER] Monitor Loop Error: {e}")
-            
-        await asyncio.sleep(2) # Update every 2 seconds for responsiveness
 
 @sio.event
 async def stop_audio(sid):
@@ -589,81 +513,6 @@ async def discover_kasa(sid):
         await sio.emit('error', {'msg': f"Kasa Discovery Failed: {str(e)}"})
 
 @sio.event
-async def iterate_cad(sid, data):
-    # data: { prompt: "make it bigger" }
-    prompt = data.get('prompt')
-    print(f"Received iterate_cad request: '{prompt}'")
-    
-    if not audio_loop or not audio_loop.cad_agent:
-        await sio.emit('error', {'msg': "CAD Agent not available"})
-        return
-
-    try:
-        # Notify user work has started
-        await sio.emit('status', {'msg': 'Iterating design...'})
-        await sio.emit('cad_status', {'status': 'generating'})
-        
-        # Call the agent with project path
-        cad_output_dir = str(audio_loop.project_manager.get_current_project_path() / "cad")
-        result = await audio_loop.cad_agent.iterate_prototype(prompt, output_dir=cad_output_dir)
-        
-        if result:
-            info = f"{len(result.get('data', ''))} bytes (STL)"
-            print(f"Sending updated CAD data: {info}")
-            await sio.emit('cad_data', result)
-            # Save to Project
-            if 'file_path' in result:
-                saved_path = audio_loop.project_manager.save_cad_artifact(result['file_path'], prompt)
-                if saved_path:
-                    print(f"[SERVER] Saved iterated CAD to {saved_path}")
-
-            await sio.emit('status', {'msg': 'Design updated'})
-        else:
-            await sio.emit('error', {'msg': 'Failed to update design'})
-            
-    except Exception as e:
-        print(f"Error iterating CAD: {e}")
-        await sio.emit('error', {'msg': f"Iteration Error: {str(e)}"})
-
-@sio.event
-async def generate_cad(sid, data):
-    # data: { prompt: "make a cube" }
-    prompt = data.get('prompt')
-    print(f"Received generate_cad request: '{prompt}'")
-    
-    if not audio_loop or not audio_loop.cad_agent:
-        await sio.emit('error', {'msg': "CAD Agent not available"})
-        return
-
-    try:
-        await sio.emit('status', {'msg': 'Generating new design...'})
-        await sio.emit('cad_status', {'status': 'generating'})
-        
-        # Use generate_prototype based on prompt with project path
-        cad_output_dir = str(audio_loop.project_manager.get_current_project_path() / "cad")
-        result = await audio_loop.cad_agent.generate_prototype(prompt, output_dir=cad_output_dir)
-        
-        if result:
-            info = f"{len(result.get('data', ''))} bytes (STL)"
-            print(f"Sending newly generated CAD data: {info}")
-            await sio.emit('cad_data', result)
-
-
-            # Save to Project
-            if 'file_path' in result:
-                saved_path = audio_loop.project_manager.save_cad_artifact(result['file_path'], prompt)
-                if saved_path:
-                    print(f"[SERVER] Saved generated CAD to {saved_path}")
-
-            await sio.emit('status', {'msg': 'Design generated'})
-        else:
-            await sio.emit('error', {'msg': 'Failed to generate design'})
-            
-    except Exception as e:
-        print(f"Error generating CAD: {e}")
-        await sio.emit('error', {'msg': f"Generation Error: {str(e)}"})
-
-@sio.event
 async def prompt_web_agent(sid, data):
     # data: { prompt: "find xyz" }
     prompt = data.get('prompt')
@@ -693,204 +542,6 @@ async def prompt_web_agent(sid, data):
     except Exception as e:
         print(f"Error running Web Agent: {e}")
         await sio.emit('error', {'msg': f"Web Agent Error: {str(e)}"})
-
-@sio.event
-async def discover_printers(sid):
-    print("Received discover_printers request")
-    
-    # If audio_loop isn't ready yet, return saved printers from settings
-    if not audio_loop or not audio_loop.printer_agent:
-        saved_printers = SETTINGS.get("printers", [])
-        if saved_printers:
-            # Convert saved printers to the expected format
-            printer_list = []
-            for p in saved_printers:
-                printer_list.append({
-                    "name": p.get("name", p["host"]),
-                    "host": p["host"],
-                    "port": p.get("port", 80),
-                    "printer_type": p.get("type", "unknown"),
-                    "camera_url": p.get("camera_url")
-                })
-            print(f"[SERVER] Returning {len(printer_list)} saved printers (audio_loop not ready)")
-            await sio.emit('printer_list', printer_list)
-            return
-        else:
-            await sio.emit('printer_list', [])
-            await sio.emit('status', {'msg': "Connect to A.D.A to enable printer discovery"})
-            return
-        
-    try:
-        printers = await audio_loop.printer_agent.discover_printers()
-        await sio.emit('printer_list', printers)
-        await sio.emit('status', {'msg': f"Found {len(printers)} printers"})
-    except Exception as e:
-        print(f"Error discovering printers: {e}")
-        await sio.emit('error', {'msg': f"Printer Discovery Failed: {str(e)}"})
-
-@sio.event
-async def add_printer(sid, data):
-    # data: { host: "192.168.1.50", name: "My Printer", type: "moonraker" }
-    raw_host = data.get('host')
-    name = data.get('name') or raw_host
-    ptype = data.get('type', "moonraker")
-    
-    # Parse port if present
-    if ":" in raw_host:
-        host, port_str = raw_host.split(":")
-        port = int(port_str)
-    else:
-        host = raw_host
-        port = 80
-    
-    print(f"Received add_printer request: {host}:{port} ({ptype})")
-    
-    if not audio_loop or not audio_loop.printer_agent:
-        await sio.emit('error', {'msg': "Printer Agent not available"})
-        return
-        
-    try:
-        # Add manually
-        camera_url = data.get('camera_url')
-        printer = audio_loop.printer_agent.add_printer_manually(name, host, port=port, printer_type=ptype, camera_url=camera_url)
-        
-        # Save to settings
-        new_printer_config = {
-            "name": name,
-            "host": host,
-            "port": port,
-            "type": ptype,
-            "camera_url": camera_url
-        }
-        
-        # Check if already exists to avoid duplicates
-        exists = False
-        for p in SETTINGS.get("printers", []):
-            if p["host"] == host and p["port"] == port:
-                exists = True
-                break
-        
-        if not exists:
-            if "printers" not in SETTINGS:
-                SETTINGS["printers"] = []
-            SETTINGS["printers"].append(new_printer_config)
-            save_settings()
-            print(f"[SERVER] Saved printer {name} to settings.")
-        
-        # Probe to confirm/correct type
-        print(f"Probing {host} to confirm type...")
-        # Try port 7125 (Moonraker) and 4408 (Fluidd/K1) 
-        ports_to_try = [80, 7125, 4408]
-        
-        actual_type = "unknown"
-        for port in ports_to_try:
-             found_type = await audio_loop.printer_agent._probe_printer_type(host, port)
-             if found_type.value != "unknown":
-                 actual_type = found_type
-                 # Update port if different
-                 if port != 80:
-                     printer.port = port
-                 break
-        
-        if actual_type != "unknown" and actual_type != printer.printer_type:
-             printer.printer_type = actual_type
-             print(f"Corrected type to {actual_type.value} on port {printer.port}")
-             
-        # Refresh list for everyone
-        printers = [p.to_dict() for p in audio_loop.printer_agent.printers.values()]
-        await sio.emit('printer_list', printers)
-        await sio.emit('status', {'msg': f"Added printer: {name}"})
-        
-    except Exception as e:
-        print(f"Error adding printer: {e}")
-        await sio.emit('error', {'msg': f"Failed to add printer: {str(e)}"})
-
-@sio.event
-async def print_stl(sid, data):
-    print(f"Received print_stl request: {data}")
-    # data: { stl_path: "path/to.stl" | "current", printer: "name_or_ip", profile: "optional" }
-    
-    if not audio_loop or not audio_loop.printer_agent:
-        await sio.emit('error', {'msg': "Printer Agent not available"})
-        return
-        
-    try:
-        stl_path = data.get('stl_path', 'current')
-        printer_name = data.get('printer')
-        profile = data.get('profile')
-        
-        if not printer_name:
-             await sio.emit('error', {'msg': "No printer specified"})
-             return
-             
-        await sio.emit('status', {'msg': f"Preparing print for {printer_name}..."})
-        
-        # Get current project path for resolution
-        current_project_path = None
-        if audio_loop and audio_loop.project_manager:
-            current_project_path = str(audio_loop.project_manager.get_current_project_path())
-            print(f"[SERVER DEBUG] Using project path: {current_project_path}")
-
-        # Resolve STL path before slicing so we can preview it
-        resolved_stl = audio_loop.printer_agent._resolve_file_path(stl_path, current_project_path)
-        
-        if resolved_stl and os.path.exists(resolved_stl):
-            # Open the STL in the CAD module for preview
-            try:
-                import base64
-                with open(resolved_stl, 'rb') as f:
-                    stl_data = f.read()
-                stl_b64 = base64.b64encode(stl_data).decode('utf-8')
-                stl_filename = os.path.basename(resolved_stl)
-                
-                print(f"[SERVER] Opening STL in CAD module: {stl_filename}")
-                await sio.emit('cad_data', {
-                    'format': 'stl',
-                    'data': stl_b64,
-                    'filename': stl_filename
-                })
-            except Exception as e:
-                print(f"[SERVER] Warning: Could not preview STL: {e}")
-        
-        # Progress Callback
-        async def on_slicing_progress(percent, message):
-            await sio.emit('slicing_progress', {
-                'printer': printer_name,
-                'percent': percent,
-                'message': message
-            })
-            if percent < 100:
-                 await sio.emit('status', {'msg': f"Slicing: {percent}%"})
-
-        result = await audio_loop.printer_agent.print_stl(
-            stl_path, 
-            printer_name, 
-            profile,
-            progress_callback=on_slicing_progress,
-            root_path=current_project_path
-        )
-        
-        await sio.emit('print_result', result)
-        await sio.emit('status', {'msg': f"Print Job: {result.get('status', 'unknown')}"})
-        
-    except Exception as e:
-        print(f"Error printing STL: {e}")
-        await sio.emit('error', {'msg': f"Print Failed: {str(e)}"})
-
-@sio.event
-async def get_slicer_profiles(sid):
-    """Get available OrcaSlicer profiles for manual selection."""
-    print("Received get_slicer_profiles request")
-    if not audio_loop or not audio_loop.printer_agent:
-        await sio.emit('error', {'msg': "Printer Agent not available"})
-        return
-    
-    try:
-        profiles = audio_loop.printer_agent.get_available_profiles()
-        await sio.emit('slicer_profiles', profiles)
-    except Exception as e:
-        print(f"Error getting slicer profiles: {e}")
-        await sio.emit('error', {'msg': f"Failed to get profiles: {str(e)}"})
 
 @sio.event
 async def control_kasa(sid, data):
