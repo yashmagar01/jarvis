@@ -52,9 +52,7 @@ function App() {
     const [isVideoOn, setIsVideoOn] = useState(false); // Video state
     const [messages, setMessages] = useState([]);
     const [inputValue, setInputValue] = useState('');
-    const [cadData, setCadData] = useState(null);
-    const [cadThoughts, setCadThoughts] = useState(''); // Streaming AI thoughts
-    const [cadRetryInfo, setCadRetryInfo] = useState({ attempt: 1, maxAttempts: 3, error: null }); // Retry status
+    // CAD-related state removed
     const [browserData, setBrowserData] = useState({ image: null, logs: [] });
     // showMemoryPrompt removed - memory is now actively saved to project
     const [confirmationRequest, setConfirmationRequest] = useState(null); // { id, tool, args }
@@ -86,28 +84,22 @@ function App() {
         video: { x: 40, y: 80 }, // Initial positions (approximate)
         visualizer: { x: window.innerWidth / 2, y: window.innerHeight / 2 - 150 },
         chat: { x: window.innerWidth / 2, y: window.innerHeight / 2 + 100 },
-        cad: { x: window.innerWidth / 2 + 300, y: window.innerHeight / 2 },
         browser: { x: window.innerWidth / 2 - 300, y: window.innerHeight / 2 },
-        kasa: { x: window.innerWidth / 2 + 350, y: window.innerHeight / 2 - 100 },
-        printer: { x: window.innerWidth / 2 - 350, y: window.innerHeight / 2 - 100 },
         tools: { x: window.innerWidth / 2, y: window.innerHeight - 100 } // Fixed bottom OFFSET
     });
 
     const [elementSizes, setElementSizes] = useState({
         visualizer: { w: 550, h: 350 },
         chat: { w: 550, h: 220 },
-        tools: { w: 500, h: 80 }, // Approx
-        cad: { w: 400, h: 400 },
+        tools: { w: 500, h: 80 },
         browser: { w: 550, h: 380 },
-        video: { w: 320, h: 180 },
-        kasa: { w: 300, h: 380 }, // Approx
-        printer: { w: 380, h: 380 } // Approx
+        video: { w: 320, h: 180 }
     });
     const [activeDragElement, setActiveDragElement] = useState(null);
 
     // Z-Index Stacking Order (last element = highest z-index)
     const [zIndexOrder, setZIndexOrder] = useState([
-        'visualizer', 'chat', 'tools', 'video', 'cad', 'browser', 'kasa', 'printer'
+        'visualizer', 'chat', 'tools', 'video', 'browser'
     ]);
 
     // Hand Control State
@@ -353,6 +345,11 @@ function App() {
             if (settings && typeof settings.face_auth_enabled !== 'undefined') {
                 setFaceAuthEnabled(settings.face_auth_enabled);
                 localStorage.setItem('face_auth_enabled', settings.face_auth_enabled);
+                // If face auth is disabled, hide lock screen and mark as authenticated
+                if (!settings.face_auth_enabled) {
+                    setIsLockScreenVisible(false);
+                    setIsAuthenticated(true);
+                }
             }
             if (typeof settings.camera_flipped !== 'undefined') {
                 console.log("[Settings] Camera flip set to:", settings.camera_flipped);
@@ -1286,20 +1283,6 @@ function App() {
                             FPS: {fps}
                         </div>
                     )}
-                    {/* Connected Printers Count */}
-                    {printerCount > 0 && (
-                        <div className="flex items-center gap-1.5 text-[10px] text-green-400 border border-green-500/30 bg-green-500/10 px-2 py-0.5 rounded ml-2">
-                            <Printer size={10} className="text-green-400" />
-                            <span>{printerCount} Printer{printerCount !== 1 ? 's' : ''}</span>
-                        </div>
-                    )}
-                    {/* Connected Smart Devices Count */}
-                    {kasaDevices.length > 0 && (
-                        <div className="flex items-center gap-1.5 text-[10px] text-yellow-400 border border-yellow-500/30 bg-yellow-500/10 px-2 py-0.5 rounded ml-2">
-                            <span>💡</span>
-                            <span>{kasaDevices.length} Device{kasaDevices.length !== 1 ? 's' : ''}</span>
-                        </div>
-                    )}
                 </div>
 
                 {/* Top Visualizer (User Mic) */}
@@ -1409,52 +1392,6 @@ function App() {
                     />
                 )}
 
-                {/* CAD Window Overlay - Moved outside of Video so it can show independently */}
-                {showCadWindow && (
-                    <div
-                        id="cad"
-                        className={`absolute flex flex-col transition-all duration-200 
-                        backdrop-blur-xl bg-black/40 border border-white/10 shadow-2xl overflow-hidden rounded-2xl
-                        ${activeDragElement === 'cad' ? 'ring-2 ring-green-500 bg-green-500/10' : ''}
-                    `}
-                        style={{
-                            left: elementPositions.cad?.x || window.innerWidth / 2,
-                            top: elementPositions.cad?.y || window.innerHeight / 2,
-                            transform: 'translate(-50%, -50%)',
-                            width: `${elementSizes.cad.w}px`,
-                            height: `${elementSizes.cad.h}px`,
-                            pointerEvents: 'auto',
-                            zIndex: getZIndex('cad')
-                        }}
-                        onMouseDown={(e) => handleMouseDown(e, 'cad')}
-                    >
-                        {/* Drag Handle Header */}
-                        <div
-                            data-drag-handle
-                            className="h-8 bg-gray-900/80 border-b border-cyan-500/20 flex items-center justify-between px-3 cursor-grab active:cursor-grabbing shrink-0"
-                        >
-                            <span className="text-xs font-bold tracking-widest text-cyan-500/70">CAD PROTOTYPE</span>
-                            <button
-                                onClick={() => setShowCadWindow(false)}
-                                className="text-gray-400 hover:text-red-400 hover:bg-red-500/20 p-1 rounded transition-colors"
-                            >
-                                ✕
-                            </button>
-                        </div>
-                        <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 pointer-events-none mix-blend-overlay z-10"></div>
-                        <div className="relative z-20 flex-1 min-h-0">
-                            <CadWindow
-                                data={cadData}
-                                thoughts={cadThoughts}
-                                retryInfo={cadRetryInfo}
-                                onClose={() => setShowCadWindow(false)}
-                                socket={socket}
-                            />
-                        </div>
-                    </div>
-                )}
-
-
                 {/* Browser Window Overlay */}
                 {showBrowserWindow && (
                     <div
@@ -1514,12 +1451,6 @@ function App() {
                         onToggleVideo={toggleVideo}
                         onToggleSettings={() => setShowSettings(!showSettings)}
                         onToggleHand={() => setIsHandTrackingEnabled(!isHandTrackingEnabled)}
-                        onToggleKasa={toggleKasaWindow}
-                        showKasaWindow={showKasaWindow}
-                        onTogglePrinter={togglePrinterWindow}
-                        showPrinterWindow={showPrinterWindow}
-                        onToggleCad={() => setShowCadWindow(!showCadWindow)}
-                        showCadWindow={showCadWindow}
                         onToggleBrowser={() => setShowBrowserWindow(!showBrowserWindow)}
                         showBrowserWindow={showBrowserWindow}
                         activeDragElement={activeDragElement}
@@ -1528,32 +1459,7 @@ function App() {
                     />
                 </div>
 
-                {/* Kasa Window */}
-                {showKasaWindow && (
-                    <KasaWindow
-                        socket={socket}
-                        position={elementPositions.kasa}
-                        activeDragElement={activeDragElement}
-                        setActiveDragElement={setActiveDragElement}
-                        devices={kasaDevices}
-                        onClose={() => setShowKasaWindow(false)}
-                        onMouseDown={(e) => handleMouseDown(e, 'kasa')}
-                        zIndex={getZIndex('kasa')}
-                    />
-                )}
-
-                {/* Printer Window */}
-                {showPrinterWindow && (
-                    <PrinterWindow
-                        socket={socket}
-                        onClose={() => setShowPrinterWindow(false)}
-                        position={elementPositions.printer}
-                        onMouseDown={(e) => handleMouseDown(e, 'printer')}
-                        activeDragElement={activeDragElement}
-                        setActiveDragElement={setActiveDragElement}
-                        zIndex={getZIndex('printer')}
-                    />
-                )}
+                {/* Kasa and Printer windows removed */}
 
                 {/* Memory Prompt removed - memory is now actively saved to project */}
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Mic, MicOff, Settings, Power, Video, VideoOff, Hand, Lightbulb, Printer, Globe, Box } from 'lucide-react';
+import { Mic, MicOff, Settings, Power, Video, VideoOff, Hand, Globe } from 'lucide-react';
 
 const ToolsModule = ({
     isConnected,
@@ -11,18 +11,10 @@ const ToolsModule = ({
     onToggleMute,
     onToggleVideo,
     onToggleSettings,
-
     onToggleHand,
-    onToggleKasa,
-    showKasaWindow,
-    onTogglePrinter,
-    showPrinterWindow,
-    onToggleCad,
-    showCadWindow,
     onToggleBrowser,
     showBrowserWindow,
     activeDragElement,
-
     position,
     onMouseDown
 }) => {
@@ -96,39 +88,6 @@ const ToolsModule = ({
                         } `}
                 >
                     <Hand size={24} />
-                </button>
-
-                {/* Kasa Light Control */}
-                <button
-                    onClick={onToggleKasa}
-                    className={`p-3 rounded-full border-2 transition-all duration-300 ${showKasaWindow
-                        ? 'border-yellow-300 bg-yellow-300/10 text-yellow-300 hover:bg-yellow-300/20 shadow-[0_0_15px_rgba(253,224,71,0.3)]'
-                        : 'border-cyan-900 text-cyan-700 hover:border-cyan-500 hover:text-cyan-500'
-                        } `}
-                >
-                    <Lightbulb size={24} />
-                </button>
-
-                {/* 3D Printer Control */}
-                <button
-                    onClick={onTogglePrinter}
-                    className={`p-3 rounded-full border-2 transition-all duration-300 ${showPrinterWindow
-                        ? 'border-green-400 bg-green-400/10 text-green-400 hover:bg-green-400/20'
-                        : 'border-cyan-900 text-cyan-700 hover:border-green-500 hover:text-green-500'
-                        } `}
-                >
-                    <Printer size={24} />
-                </button>
-
-                {/* CAD Agent Toggle */}
-                <button
-                    onClick={onToggleCad}
-                    className={`p-3 rounded-full border-2 transition-all duration-300 ${showCadWindow
-                        ? 'border-cyan-400 bg-cyan-400/10 text-cyan-400 hover:bg-cyan-400/20 shadow-[0_0_15px_rgba(34,211,238,0.3)]'
-                        : 'border-cyan-900 text-cyan-700 hover:border-cyan-500 hover:text-cyan-500'
-                        } `}
-                >
-                    <Box size={24} />
                 </button>
 
                 {/* Web Agent Toggle */}
