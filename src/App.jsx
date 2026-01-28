@@ -16,7 +16,13 @@ import SettingsWindow from './components/SettingsWindow';
 
 
 const socket = io('http://localhost:8000');
-const { ipcRenderer } = window.require('electron');
+// Handle Electron vs Browser environment
+const electron = window.require ? window.require('electron') : null;
+const ipcRenderer = electron ? electron.ipcRenderer : { 
+    on: () => {}, 
+    send: () => {}, 
+    invoke: () => Promise.resolve() 
+};
 
 function App() {
     const [status, setStatus] = useState('Disconnected');
