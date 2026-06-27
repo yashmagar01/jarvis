@@ -39,6 +39,20 @@ func checkScreenshot() string {
 	return "no screenshot tool found (need scrot, import, or gnome-screenshot)"
 }
 
+func checkProcesses() string {
+	if _, err := exec.LookPath("ps"); err != nil {
+		return "ps not found (required for process monitoring)"
+	}
+	return ""
+}
+
+func checkNotifications() string {
+	if _, err := exec.LookPath("dbus-monitor"); err != nil {
+		return "dbus-monitor not found (required for notification monitoring)"
+	}
+	return ""
+}
+
 func checkAwareness() string {
 	reasons := []string{}
 	if r := checkScreenshot(); r != "" {
@@ -54,12 +68,10 @@ func checkAwareness() string {
 }
 
 func checkBrowser(cfg *SidecarConfig) string {
-	for _, bin := range []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser"} {
-		if _, err := exec.LookPath(bin); err == nil {
-			return ""
-		}
+	if _, err := findChromiumExecutable(cfg); err != nil {
+		return err.Error()
 	}
-	return "no Chrome/Chromium browser found"
+	return ""
 }
 
 func checkDesktop() string {

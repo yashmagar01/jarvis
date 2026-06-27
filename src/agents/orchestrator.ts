@@ -2,7 +2,8 @@ import type { RoleDefinition } from '../roles/types.ts';
 import type { LLMMessage, LLMResponse, LLMStreamEvent, LLMToolCall, LLMTool, ContentBlock } from '../llm/provider.ts';
 import { guardImageSize } from '../llm/provider.ts';
 import { LLMManager } from '../llm/manager.ts';
-import { AgentInstance } from './agent.ts';
+import type { Tier } from '../llm/tiers.ts';
+import { AgentInstance, canSpawnChildren } from './agent.ts';
 import { AgentHierarchy } from './hierarchy.ts';
 import { ToolRegistry, type ToolDefinition, isToolResult } from '../actions/tools/registry.ts';
 import { toolDefToLLMTool } from '../actions/tools/builtin.ts';
@@ -10,11 +11,50 @@ import type { ActionCategory } from '../roles/authority.ts';
 import type { AuthorityEngine } from '../authority/engine.ts';
 import type { ApprovalManager, ApprovalRequest } from '../authority/approval.ts';
 import type { AuditTrail } from '../authority/audit.ts';
+import type { DeferredExecutor } from '../authority/deferred-executor.ts';
 import type { EmergencyController } from '../authority/emergency.ts';
 import { getActionForTool } from '../authority/tool-action-map.ts';
 
 const MAX_TOOL_ITERATIONS = 200;
 const MAX_TOOL_RESULT_CHARS = 6000; // Cap individual tool results to control context size
+// How long the authority gate blocks waiting for the user to approve a
+// gated tool call before falling back to the deferred (fire-and-forget)
+// path. Long enough to click a permission panel, short enough that an
+// ignored panel doesn't hang the conversation turn indefinitely.
+const APPROVAL_WAIT_TIMEOUT_MS = 2 * 60 * 1000;
+
+/**
+ * Special tool exposed only on processTaskCall. The orchestrator intercepts
+ * calls to this name and returns a paused state instead of dispatching it
+ * through the tool registry. Lets a task-tier LLM signal "I need more info
+ * from the user before I can continue" without ending the work it's done so
+ * far - the conversation buffer is captured for later resume.
+ */
+const ASK_FOR_CLARIFICATION_TOOL: LLMTool = {
+  name: 'ask_for_clarification',
+  description:
+    "Pause this task and ask the user a clarifying question. Use this ONLY when the user's intent is genuinely ambiguous and a single concrete question would unblock you (e.g., 'Which Sarah - Chen or Park?'). Do not use this for general chit-chat or to avoid making reasonable inferences. When you call this, the task pauses; the conversation agent will read the question to the user and resume your task with the user's answer appended.",
+  parameters: {
+    type: 'object',
+    required: ['question'],
+    properties: {
+      question: {
+        type: 'string',
+        description: 'The exact question to ask the user. Should be specific and answerable in one sentence.',
+      },
+    },
+  },
+};
+
+/**
+ * Result of a task-tier call. Either completed (final assistant text +
+ * the whole conversation buffer) or paused (the LLM called the
+ * `ask_for_clarification` tool; the conversation is captured so the task
+ * can resume from this exact point when the user replies).
+ */
+export type TaskCallResult =
+  | { kind: 'completed'; text: string; conversation: LLMMessage[] }
+  | { kind: 'paused'; question: string; conversation: LLMMessage[] };
 
 export class AgentOrchestrator {
   private hierarchy: AgentHierarchy;
@@ -24,6 +64,7 @@ export class AgentOrchestrator {
   // Authority engine components
   private authorityEngine: AuthorityEngine | null = null;
   private approvalManager: ApprovalManager | null = null;
+  private deferredExecutor: DeferredExecutor | null = null;
   private auditTrail: AuditTrail | null = null;
   private emergencyController: EmergencyController | null = null;
   private temporaryGrants: Map<string, ActionCategory[]> = new Map();
@@ -51,6 +92,15 @@ export class AgentOrchestrator {
     return this.toolRegistry;
   }
 
+  /**
+   * Public tool schema for realtime voice sessions. Same shared `LLMTool[]`
+   * the text providers consume (decision #3 — single source of truth).
+   */
+  getRealtimeTools(): LLMTool[] {
+    if (!this.toolRegistry || this.toolRegistry.count() === 0) return [];
+    return this.toolRegistry.list().map(toolDefToLLMTool);
+  }
+
   // --- Authority setters ---
 
   setAuthorityEngine(engine: AuthorityEngine): void {
@@ -59,6 +109,15 @@ export class AgentOrchestrator {
 
   setApprovalManager(manager: ApprovalManager): void {
     this.approvalManager = manager;
+  }
+
+  /**
+   * Enables inline approval execution: the authority gate blocks on the
+   * user's decision and runs the approved tool itself, so the result flows
+   * back through the task loop instead of a detached notification.
+   */
+  setDeferredExecutor(executor: DeferredExecutor): void {
+    this.deferredExecutor = executor;
   }
 
   setAuditTrail(trail: AuditTrail): void {
@@ -129,8 +188,35 @@ export class AgentOrchestrator {
       throw new Error(`Parent agent not found: ${parentId}`);
     }
 
-    if (!parent.agent.authority.can_spawn_children) {
-      throw new Error('Parent agent does not have authority to spawn children');
+    // The authority engine is the PRIME decider for spawning. The user's
+    // explicit configuration (per-action overrides, context rules, the
+    // authority slider) wins over the role-derived capability flag in
+    // BOTH directions: a `spawn_agent` deny blocks a delegation-capable
+    // role, and an allow unblocks a role that never declared delegation.
+    // This also covers spawn paths that bypass the tool-level gate
+    // (dashboard spawn dialog, workflow delegator). The role flag is
+    // only the fallback when no engine is wired (tests, embedded use).
+    if (this.authorityEngine) {
+      const decision = this.authorityEngine.checkAuthority({
+        agentId: parent.id,
+        agentAuthorityLevel: parent.agent.authority.max_authority_level,
+        agentRoleId: parent.agent.role.id,
+        toolName: 'spawn_sub_agent',
+        toolCategory: 'delegation',
+        actionCategory: 'spawn_agent',
+        temporaryGrants: this.temporaryGrants,
+      });
+      if (!decision.allowed) {
+        throw new Error(`Authority denied spawning a sub-agent: ${decision.reason}`);
+      }
+      // `requiresApproval` is intentionally treated as allowed here: the
+      // soft gate runs at the TOOL layer (executeTool intercepts
+      // delegate_task/manage_agents before they execute), so by the time
+      // we get here the approval either wasn't needed or was granted.
+    } else if (!parent.agent.authority.can_spawn_children) {
+      throw new Error(
+        `Agent role "${parent.agent.role.id}" cannot spawn sub-agents: the role declares neither the "delegation" tool nor any sub_roles. Add "delegation" to the role's tools list to enable delegation.`,
+      );
     }
 
     // Create child agent with reduced authority
@@ -144,7 +230,7 @@ export class AgentOrchestrator {
       ),
       denied_tools: parent.agent.authority.denied_tools,
       max_token_budget: Math.floor(parent.agent.authority.max_token_budget / 2),
-      can_spawn_children: role.sub_roles.length > 0,
+      can_spawn_children: canSpawnChildren(role),
     };
 
     const agent = new AgentInstance(role, {
@@ -155,10 +241,14 @@ export class AgentOrchestrator {
 
     this.hierarchy.addAgent(agent);
 
-    // Add system message with role context for sub-agents
+    // Add system message with role context for sub-agents. Communication
+    // style is optional - only inject the line when the role declares one.
+    const styleLine = role.communication_style
+      ? `\n\nCommunication style: ${role.communication_style.tone} tone, ${role.communication_style.verbosity} verbosity, ${role.communication_style.formality} formality.`
+      : '';
     agent.addMessage(
       'system',
-      `You are ${role.name}, spawned by ${parent.agent.role.name}. ${role.description}\n\nResponsibilities:\n${role.responsibilities.map((r) => `- ${r}`).join('\n')}\n\nYou report to: ${parent.agent.role.name}\n\nCommunication style: ${role.communication_style.tone} tone, ${role.communication_style.verbosity} verbosity, ${role.communication_style.formality} formality.`
+      `You are ${role.name}, spawned by ${parent.agent.role.name}. ${role.description}\n\nResponsibilities:\n${role.responsibilities.map((r) => `- ${r}`).join('\n')}\n\nYou report to: ${parent.agent.role.name}.${styleLine}`,
     );
 
     return agent;
@@ -203,8 +293,19 @@ export class AgentOrchestrator {
   /**
    * Process a user message through the primary agent (non-streaming).
    * Includes the tool execution loop: LLM → tool_calls → execute → re-call → repeat.
+   *
+   * @param tier Which task tier runs the LLM call (default 'medium' for
+   *   classic mode). Conv-tier delegation passes through with the requested
+   *   tier so delegated work uses the full primary tool registry on the
+   *   chosen model.
+   * @param subsystem Usage-tracking label for the tier call.
    */
-  async processMessage(systemPrompt: string, message: string): Promise<string> {
+  async processMessage(
+    systemPrompt: string,
+    message: string,
+    tier: Tier = 'medium',
+    subsystem: string = 'chat_orchestrator',
+  ): Promise<string> {
     const primary = this.getPrimary();
     if (!primary) {
       throw new Error('No primary agent exists. Create one first.');
@@ -231,7 +332,7 @@ export class AgentOrchestrator {
 
     // Tool execution loop
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-      const llmResponse: LLMResponse = await this.llmManager.chat(messages, { tools });
+      const llmResponse: LLMResponse = await this.llmManager.chatTier(tier, subsystem, messages, { tools });
 
       if (llmResponse.finish_reason === 'tool_use' && llmResponse.tool_calls.length > 0) {
         // Add assistant message with tool calls to local messages
@@ -282,11 +383,120 @@ export class AgentOrchestrator {
   }
 
   /**
+   * Task-tier call with pause/resume semantics. Runs the same tool execution
+   * loop as `processMessage`, but:
+   *   - Does NOT touch the primary agent's persistent history (task tier
+   *     conversations are scoped to a single task, not the global thread).
+   *   - Exposes the `ask_for_clarification` tool to the LLM so it can pause
+   *     execution and request user input.
+   *   - Accepts an optional `history` so a paused task can be resumed by
+   *     re-entering the loop with the saved messages + a new user reply.
+   *
+   * Returns either a completed result (text + final conversation snapshot)
+   * or a paused result (the question + the conversation up to the pause).
+   * In the paused case, the caller stores the conversation on the task
+   * record so a subsequent `resume` can continue from the same buffer.
+   */
+  async processTaskCall(opts: {
+    systemPrompt: string;
+    userMessage: string;
+    tier: Tier;
+    subsystem: string;
+    /** When resuming, pass the conversation captured at the pause + the new user reply. */
+    history?: LLMMessage[];
+    signal?: AbortSignal;
+  }): Promise<TaskCallResult> {
+    if (!this.llmManager) {
+      return { kind: 'completed', text: '[No LLM configured]', conversation: [] };
+    }
+
+    // Build the running conversation buffer. On a fresh call: system + user
+    // message. On resume: prior conversation + a new user message (the
+    // clarification reply).
+    const messages: LLMMessage[] = opts.history
+      ? [...opts.history, { role: 'user', content: opts.userMessage }]
+      : [
+          { role: 'system', content: opts.systemPrompt },
+          { role: 'user', content: opts.userMessage },
+        ];
+
+    // Include the standard tools plus the special clarification tool.
+    const baseTools = this.getLLMTools() ?? [];
+    const tools: LLMTool[] = [...baseTools, ASK_FOR_CLARIFICATION_TOOL];
+
+    let finalText = '';
+
+    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+      if (opts.signal?.aborted) {
+        return { kind: 'completed', text: finalText, conversation: messages };
+      }
+
+      const llmResponse: LLMResponse = await this.llmManager.chatTier(
+        opts.tier,
+        opts.subsystem,
+        messages,
+        { tools },
+      );
+
+      if (llmResponse.finish_reason === 'tool_use' && llmResponse.tool_calls.length > 0) {
+        // First, scan tool calls for `ask_for_clarification` - that breaks
+        // the loop and returns a paused result without executing anything
+        // else in this batch. We DO record the assistant message + the
+        // clarification call in the conversation so resume can replay the
+        // LLM's "I need more info" turn.
+        const clarifyCall = llmResponse.tool_calls.find((tc) => tc.name === ASK_FOR_CLARIFICATION_TOOL.name);
+        if (clarifyCall) {
+          const args = clarifyCall.arguments as { question?: string };
+          const question = (args.question ?? '').trim() || 'I need more information to continue.';
+          messages.push({
+            role: 'assistant',
+            content: llmResponse.content,
+            tool_calls: llmResponse.tool_calls,
+          });
+          // The tool result is a stub that says "asked the user" - lets the
+          // model see what it asked when it resumes.
+          messages.push({
+            role: 'tool',
+            content: `[Paused: asked user "${question}" - resume will append the user's reply.]`,
+            tool_call_id: clarifyCall.id,
+          });
+          return { kind: 'paused', question, conversation: messages };
+        }
+
+        messages.push({
+          role: 'assistant',
+          content: llmResponse.content,
+          tool_calls: llmResponse.tool_calls,
+        });
+
+        for (const tc of llmResponse.tool_calls) {
+          const result = await this.executeTool(tc, opts.signal);
+          messages.push({
+            role: 'tool',
+            content: result,
+            tool_call_id: tc.id,
+          });
+        }
+        continue;
+      }
+
+      finalText = llmResponse.content;
+      if (llmResponse.finish_reason === 'length') {
+        finalText += '\n\n[Response was truncated due to output token limits.]';
+      }
+      messages.push({ role: 'assistant', content: finalText });
+      break;
+    }
+
+    return { kind: 'completed', text: finalText, conversation: messages };
+  }
+
+  /**
    * Stream a message through the primary agent with tool execution loop.
    * Yields text/tool_call events through all iterations.
    * Only emits 'done' when the final response is complete.
    */
-  async *streamMessage(systemPrompt: string, message: string): AsyncIterable<LLMStreamEvent> {
+  async *streamMessage(systemPrompt: string, message: string | import('../llm/provider.ts').ContentBlock[]): AsyncIterable<LLMStreamEvent> {
     const primary = this.getPrimary();
     if (!primary) {
       throw new Error('No primary agent exists. Create one first.');
@@ -297,7 +507,8 @@ export class AgentOrchestrator {
 
     // If no LLM manager, yield placeholder
     if (!this.llmManager) {
-      const response = `[No LLM configured] Received: ${message}`;
+      const stub = typeof message === 'string' ? message : '[image+text content]';
+      const response = `[No LLM configured] Received: ${stub}`;
       primary.addMessage('assistant', response);
       yield { type: 'text', text: response };
       yield {
@@ -331,7 +542,7 @@ export class AgentOrchestrator {
       let doneResponse: LLMResponse | null = null;
 
       // Stream from LLM
-      for await (const event of this.llmManager.stream(messages, { tools })) {
+      for await (const event of this.llmManager.streamTier('medium', 'chat_orchestrator_stream', messages, { tools })) {
         if (event.type === 'text') {
           accumulatedText += event.text;
           yield event; // Forward text chunks to client
@@ -450,7 +661,7 @@ export class AgentOrchestrator {
       ...primary.getMessages(),
     ];
 
-    const llmResponse: LLMResponse = await this.llmManager.chat(messages);
+    const llmResponse: LLMResponse = await this.llmManager.chatTier('medium', 'chat_orchestrator_subagent', messages);
 
     if (llmResponse.content && llmResponse.content.trim().length > 0) {
       primary.addMessage('assistant', llmResponse.content);
@@ -477,8 +688,11 @@ export class AgentOrchestrator {
    * Execute a single tool call via the ToolRegistry.
    * Includes authority gate: checks emergency state, authority level, and governed categories.
    * Returns a string for text-only results, or ContentBlock[] for multi-modal results (images).
+   *
+   * `signal` (task-tier calls) lets a cancelled task break out of the
+   * blocking approval wait instead of holding the dispatch open.
    */
-  private async executeTool(toolCall: LLMToolCall): Promise<string | ContentBlock[]> {
+  private async executeTool(toolCall: LLMToolCall, signal?: AbortSignal): Promise<string | ContentBlock[]> {
     if (!this.toolRegistry) {
       return `Error: No tool registry configured`;
     }
@@ -489,6 +703,20 @@ export class AgentOrchestrator {
     if (this.emergencyController && !this.emergencyController.canExecute()) {
       const state = this.emergencyController.getState();
       return `[SYSTEM ${state.toUpperCase()}] All tool execution is currently suspended. The user has ${state} the system.`;
+    }
+
+    // 1a. Bypass for the intent-gating tool itself.
+    // request_approval IS the authority mechanism — gating it would recurse.
+    // Its arguments carry the semantic action_category, so auditing happens
+    // inside the tool on resolution.
+    if (toolCall.name === 'request_approval') {
+      try {
+        const raw = await this.toolRegistry.execute(toolCall.name, toolCall.arguments);
+        if (isToolResult(raw)) return raw.content.map(guardImageSize);
+        return typeof raw === 'string' ? raw : JSON.stringify(raw);
+      } catch (err) {
+        return `Error executing request_approval: ${err instanceof Error ? err.message : String(err)}`;
+      }
     }
 
     // 2. Authority check
@@ -532,6 +760,12 @@ export class AgentOrchestrator {
       // 5. Requires approval
       if (decision.requiresApproval && this.approvalManager) {
         const urgency = this.determineUrgency(actionCategory);
+        // Inline mode: block here until the user decides, then execute the
+        // tool ourselves so the result returns through the task loop (and
+        // from there to the conversation tier), instead of being executed
+        // detached on approval and broadcast as a raw notification.
+        // Deferred mode is the fallback when no executor is wired.
+        const inline = this.deferredExecutor !== null;
         const request = this.approvalManager.createRequest({
           agentId: primary.id,
           agentName: primary.agent.role.name,
@@ -541,15 +775,68 @@ export class AgentOrchestrator {
           urgency,
           reason: decision.reason,
           context: `Agent attempted: ${toolCall.name}(${JSON.stringify(toolCall.arguments).slice(0, 200)})`,
+          executionMode: inline ? 'inline' : 'deferred',
         });
 
         // Emit approval request event
         this.onApprovalNeeded?.(request);
 
-        return `[AWAITING_APPROVAL] Request #${request.id.slice(0, 8)} submitted. ` +
-               `Action: ${toolCall.name} (${actionCategory}). ` +
-               `Reason: ${decision.reason}. ` +
-               `The user will be notified and can approve or deny this action.`;
+        if (!inline) {
+          return `[AWAITING_APPROVAL] Request #${request.id.slice(0, 8)} submitted. ` +
+                 `Action: ${toolCall.name} (${actionCategory}). ` +
+                 `Reason: ${decision.reason}. ` +
+                 `The user will be notified and can approve or deny this action.`;
+        }
+
+        const resolved = await this.approvalManager.waitForResolution(request.id, {
+          timeoutMs: APPROVAL_WAIT_TIMEOUT_MS,
+          signal,
+        });
+
+        switch (resolved.status) {
+          case 'approved':
+            // The approve endpoints skip execution for inline requests; we
+            // are the single executor. executeApproved handles markExecuted,
+            // audit, and approval learning.
+            return await this.deferredExecutor!.executeApproved(request.id);
+          case 'executed':
+            // Another path already ran it (shouldn't happen for inline
+            // requests; tolerated for robustness). Surface its result.
+            return resolved.execution_result ?? `[EXECUTED] ${toolCall.name} completed.`;
+          case 'denied':
+            return `[APPROVAL DENIED] The user denied permission to execute ${toolCall.name}. ` +
+                   `Do not retry the action. Briefly tell the user it was not performed.`;
+          case 'expired':
+            return `[APPROVAL EXPIRED] The approval request for ${toolCall.name} expired before the user decided. ` +
+                   `Ask the user whether they still want this done.`;
+          case 'pending':
+          default: {
+            // Timed out waiting (or the task was cancelled mid-wait). Hand
+            // the request to the deferred path so a late click still
+            // executes it. demoteToDeferred only succeeds while the request
+            // is still pending, so it cannot race an approve into a double
+            // execution: if the user approved in the meantime, the demotion
+            // fails and we execute inline after all.
+            if (!this.approvalManager.demoteToDeferred(request.id)) {
+              const recheck = this.approvalManager.getRequest(request.id);
+              if (recheck?.status === 'approved') {
+                return await this.deferredExecutor!.executeApproved(request.id);
+              }
+              if (recheck?.status === 'executed') {
+                return recheck.execution_result ?? `[EXECUTED] ${toolCall.name} completed.`;
+              }
+              if (recheck?.status === 'denied') {
+                return `[APPROVAL DENIED] The user denied permission to execute ${toolCall.name}. ` +
+                       `Do not retry the action. Briefly tell the user it was not performed.`;
+              }
+            }
+            return `[AWAITING_APPROVAL] Request #${request.id.slice(0, 8)} submitted. ` +
+                   `Action: ${toolCall.name} (${actionCategory}). ` +
+                   `Reason: ${decision.reason}. ` +
+                   `The user has not responded yet. They can still approve or deny it later; ` +
+                   `if approved later, it will be executed and the user will be notified.`;
+          }
+        }
       }
     }
 
@@ -578,6 +865,95 @@ export class AgentOrchestrator {
       return result;
     } catch (err) {
       return `Error executing ${toolCall.name}: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  /**
+   * Execute a tool call originating from a premium realtime (gpt-realtime-2)
+   * voice session. Mirrors `executeTool`'s authority gate BUT auto-approves:
+   * a `requiresApproval` decision is treated as granted so the audio loop is
+   * never blocked (decision #2, see docs/GPT_REALTIME_2_INTEGRATION.md §4 Phase 3).
+   *
+   * Still enforced: emergency state, explicit hard denies, and the
+   * user-configured `blockedCategories` backstop. Every call is written to the
+   * audit trail tagged `channel:'voice'`; an auto-approved call is recorded as
+   * `approval_required` + `executed:true` so the trail shows no human confirmed it.
+   *
+   * Always returns a string (the tool result or an error/denial marker) — the
+   * realtime session feeds this straight back to the model as function output.
+   */
+  async executeRealtimeToolCall(
+    name: string,
+    args: Record<string, unknown>,
+    opts: { blockedCategories?: string[] } = {},
+  ): Promise<string> {
+    if (!this.toolRegistry) return 'Error: No tool registry configured';
+
+    // 1. Emergency check (same as text path).
+    if (this.emergencyController && !this.emergencyController.canExecute()) {
+      const state = this.emergencyController.getState();
+      return `[SYSTEM ${state.toUpperCase()}] Tool execution is currently suspended.`;
+    }
+
+    const primary = this.getPrimary();
+    const tool = this.toolRegistry.get(name);
+    const actionCategory = getActionForTool(name, tool?.category ?? 'unknown');
+
+    const logAudit = (decision: 'allowed' | 'denied' | 'approval_required', executed: boolean) => {
+      if (!primary) return;
+      this.auditTrail?.log({
+        agent_id: primary.id,
+        agent_name: primary.agent.role.name,
+        tool_name: name,
+        action_category: actionCategory,
+        authority_decision: decision,
+        approval_id: null,
+        executed,
+        channel: 'voice',
+      });
+    };
+
+    // 2. User backstop: categories that stay blocked even under auto-approve.
+    if (opts.blockedCategories?.includes(actionCategory)) {
+      logAudit('denied', false);
+      return `[BLOCKED] ${name} (${actionCategory}) is in the realtime blocked-categories list and was not executed.`;
+    }
+
+    // 3. Authority check — hard denies enforced; approval auto-granted.
+    if (this.authorityEngine && primary) {
+      const decision = this.authorityEngine.checkAuthority({
+        agentId: primary.id,
+        agentAuthorityLevel: primary.agent.authority.max_authority_level,
+        agentRoleId: primary.agent.role.id,
+        toolName: name,
+        toolCategory: tool?.category ?? 'unknown',
+        actionCategory,
+        temporaryGrants: this.temporaryGrants,
+      });
+
+      if (!decision.allowed) {
+        logAudit('denied', false);
+        return `[AUTHORITY DENIED] Cannot execute ${name}: ${decision.reason}.`;
+      }
+
+      // requiresApproval -> auto-approved in realtime; audited as such.
+      logAudit(decision.requiresApproval ? 'approval_required' : 'allowed', true);
+    }
+
+    // 4. Execute.
+    try {
+      const raw = await this.toolRegistry.execute(name, args);
+      if (isToolResult(raw)) {
+        // Realtime function output is text; flatten non-text blocks to a tag.
+        return raw.content.map((c) => (c.type === 'text' ? c.text : `[${c.type}]`)).join('\n');
+      }
+      let result = typeof raw === 'string' ? raw : JSON.stringify(raw);
+      if (result.length > MAX_TOOL_RESULT_CHARS) {
+        result = result.slice(0, MAX_TOOL_RESULT_CHARS) + `\n... (truncated, was ${result.length} chars)`;
+      }
+      return result;
+    } catch (err) {
+      return `Error executing ${name}: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 

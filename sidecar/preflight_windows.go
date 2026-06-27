@@ -42,18 +42,26 @@ func checkAwareness() string {
 	return ""
 }
 
-func checkBrowser(cfg *SidecarConfig) string {
-	for _, bin := range []string{
-		"chrome",
-		"chromium",
-		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
-		`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
-	} {
-		if _, err := exec.LookPath(bin); err == nil {
-			return ""
-		}
+func checkProcesses() string {
+	// PowerShell Get-Process is built-in
+	if _, err := exec.LookPath("powershell"); err != nil {
+		return "powershell not found"
 	}
-	return "no Chrome/Chromium browser found"
+	return ""
+}
+
+func checkNotifications() string {
+	// Capturing Windows toast notifications requires the WinRT
+	// UserNotificationListener API with explicit user consent, which the
+	// sidecar does not yet implement. The observer no-ops here.
+	return "notification monitoring is not supported on Windows"
+}
+
+func checkBrowser(cfg *SidecarConfig) string {
+	if _, err := findChromiumExecutable(cfg); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func checkDesktop() string {

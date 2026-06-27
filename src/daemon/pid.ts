@@ -28,23 +28,29 @@ const LOG_DIR = join(JARVIS_DIR, 'logs');
 const LOCK_PATH = join(JARVIS_DIR, 'jarvis.pid');
 const LOG_PATH = join(LOG_DIR, 'jarvis.log');
 
+/**
+ * Resolve the lock-file path for a given data dir. The daemon itself always
+ * runs against `~/.jarvis` (no override path today), but the encryption
+ * rotation script accepts `--data-dir` and needs to probe the lock for that
+ * specific dir, not the default. Keep this in lock-step with `LOCK_PATH`
+ * above: any change to the default lock-file name has to be reflected here.
+ */
+export function lockPathFor(dataDir?: string): string {
+  if (!dataDir) return LOCK_PATH;
+  return join(dataDir, 'jarvis.pid');
+}
+
 // ── flock() via Bun cc() ────────────────────────────────────────────
 // Compiled at startup by Bun's embedded TinyCC. Resolves libc via
 // system headers — works on Linux, macOS, and any POSIX platform
 // without hardcoding a shared library path.
 
-const isWindows = process.platform === 'win32';
-
-let flock: any = null;
-if (!isWindows) {
-  const lib = cc({
-    source: flockSource,
-    symbols: {
-      do_flock: { args: ['i32', 'i32'], returns: 'i32' },
-    },
-  });
-  flock = lib.symbols;
-}
+const { symbols: flock } = cc({
+  source: flockSource,
+  symbols: {
+    do_flock: { args: ['i32', 'i32'], returns: 'i32' },
+  },
+});
 
 const LOCK_EX = 2;  // Exclusive lock
 const LOCK_NB = 4;  // Non-blocking
@@ -64,33 +70,17 @@ let lockFd: number | null = null;
  * Returns true if the lock was acquired, false if another instance holds it.
  */
 export function acquireLock(pid: number): boolean {
-  if (lockFd !== null) return false;
-
   try {
     mkdirSync(JARVIS_DIR, { recursive: true });
-
-    if (isWindows) {
-      const existingPid = readPid();
-      if (existingPid !== null && existingPid !== pid) {
-        try {
-          process.kill(existingPid, 0);
-          return false;
-        } catch {
-          // Process not running, stale lock file
-        }
-      }
-    }
 
     // Open (or create) the lock file — don't truncate before locking
     const fd = openSync(LOCK_PATH, constants.O_WRONLY | constants.O_CREAT, 0o644);
 
     // Try non-blocking exclusive lock
-    if (!isWindows) {
-      const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
-      if (result !== 0) {
-        closeSync(fd);
-        return false;
-      }
+    const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
+    if (result !== 0) {
+      closeSync(fd);
+      return false;
     }
 
     // Lock acquired — truncate and write PID for display purposes
@@ -109,51 +99,81 @@ export function acquireLock(pid: number): boolean {
 /**
  * Check if the daemon lock is currently held.
  * Returns the PID if locked (daemon running), null otherwise.
+ *
+ * Accepts an optional explicit `lockPath` to probe a non-default location
+ * (used by the encryption rotation script when given `--data-dir`). The
+ * default probes `~/.jarvis/jarvis.pid`.
  */
-export function isLocked(): number | null {
-  if (!existsSync(LOCK_PATH)) return null;
+export function isLocked(lockPath: string = LOCK_PATH): number | null {
+  if (!existsSync(lockPath)) return null;
 
   let fd: number;
   try {
-    fd = openSync(LOCK_PATH, constants.O_RDONLY);
+    fd = openSync(lockPath, constants.O_RDONLY);
   } catch {
     return null;
   }
 
   try {
-    if (!isWindows) {
-      // Try non-blocking exclusive lock to probe
-      const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
-      if (result === 0) {
-        // Lock acquired — no daemon running. Release immediately.
-        flock.do_flock(fd, LOCK_UN);
-        closeSync(fd);
-        return null;
-      }
+    // Try non-blocking exclusive lock to probe
+    const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
+    if (result === 0) {
+      // Lock acquired — no daemon running. Release immediately.
+      flock.do_flock(fd, LOCK_UN);
+      closeSync(fd);
+      return null;
     }
-    
-    // Lock held by another process (or we are on Windows) — daemon is running
+    // Lock held by another process — daemon is running
     closeSync(fd);
-    const pid = readPid();
-
-    if (isWindows && pid !== null) {
-      try {
-        process.kill(pid, 0);
-      } catch {
-        return null;
-      }
-    }
+    const pid = readPidAt(lockPath);
 
     // Container safety: if PID is 1 and we're inside a container,
     // the lock file is stale from a previous container lifecycle
     if (pid === 1 && isInsideContainer()) {
-      releaseLock();
+      // Only auto-release when probing the default daemon path. A custom
+      // lockPath probe shouldn't be allowed to nuke an arbitrary file.
+      if (lockPath === LOCK_PATH) releaseLock();
       return null;
     }
 
     return pid;
   } catch {
     try { closeSync(fd); } catch { /* already closed */ }
+    return null;
+  }
+}
+
+/**
+ * Acquire an exclusive lock at an arbitrary `lockPath`. Returns a handle that
+ * releases the lock + unlinks the file. Distinct from `acquireLock`, which
+ * always targets the default `~/.jarvis/jarvis.pid` and is only used by the
+ * daemon itself. This helper exists for tests and tools (e.g. the rotation
+ * script's test fixture) that need to simulate "a daemon is running against
+ * this data dir" without colliding with a real daemon on the dev machine.
+ *
+ * Returns null if the lock is already held.
+ */
+export function acquireLockAt(lockPath: string, pid: number): { release: () => void } | null {
+  try {
+    mkdirSync(join(lockPath, '..'), { recursive: true });
+    const fd = openSync(lockPath, constants.O_WRONLY | constants.O_CREAT, 0o644);
+    const result = flock.do_flock(fd, LOCK_EX | LOCK_NB);
+    if (result !== 0) {
+      closeSync(fd);
+      return null;
+    }
+    ftruncateSync(fd, 0);
+    writeSync(fd, String(pid));
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        try { closeSync(fd); } catch { /* already closed */ }
+        try { if (existsSync(lockPath)) unlinkSync(lockPath); } catch { /* ignore */ }
+      },
+    };
+  } catch {
     return null;
   }
 }
@@ -177,16 +197,64 @@ export function releaseLock(): void {
 
 /**
  * Read the PID from the lock file. Returns null if no file or invalid content.
+ *
+ * Lock file format (either form is accepted):
+ *   PID            (legacy — single line)
+ *   PID\nPORT      (current — PID on line 1, bound port on line 2)
  */
 export function readPid(): number | null {
-  if (!existsSync(LOCK_PATH)) return null;
+  return readPidAt(LOCK_PATH);
+}
+
+function readPidAt(lockPath: string): number | null {
+  if (!existsSync(lockPath)) return null;
   try {
-    const content = readFileSync(LOCK_PATH, 'utf-8').trim();
-    const pid = parseInt(content, 10);
+    const content = readFileSync(lockPath, 'utf-8');
+    const firstLine = content.split(/\r?\n/, 1)[0]?.trim() ?? '';
+    const pid = parseInt(firstLine, 10);
     if (isNaN(pid) || pid <= 0) return null;
     return pid;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Read the port the locked daemon bound to, if it recorded one.
+ * Returns null for legacy lock files that contain only a PID.
+ */
+export function readLockedPort(): number | null {
+  if (!existsSync(LOCK_PATH)) return null;
+  try {
+    const content = readFileSync(LOCK_PATH, 'utf-8');
+    const lines = content.split(/\r?\n/);
+    const raw = lines[1]?.trim();
+    if (!raw) return null;
+    const port = parseInt(raw, 10);
+    if (isNaN(port) || port < 1 || port > 65535) return null;
+    return port;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Record the port the daemon has successfully bound to. Called from the
+ * daemon itself after port resolution so `jarvis stop` knows exactly which
+ * port to verify, regardless of how the daemon was launched (CLI flag, env
+ * var, config file, or default).
+ *
+ * No-op if the lock isn't held by this process.
+ */
+export function writeLockedPort(port: number): void {
+  if (lockFd === null) return;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+  try {
+    const pid = process.pid;
+    ftruncateSync(lockFd, 0);
+    writeSync(lockFd, `${pid}\n${port}\n`, 0);
+  } catch (err) {
+    console.error(`[PID] Failed to record port ${port} in lock file: ${err}`);
   }
 }
 

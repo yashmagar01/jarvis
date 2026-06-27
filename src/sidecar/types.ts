@@ -4,6 +4,8 @@
  * Types for the brain-side sidecar management system.
  */
 
+import type { SidecarUpdateStatus } from './compat.ts';
+
 /** Capabilities a sidecar can advertise */
 export type SidecarCapability =
   | 'terminal'
@@ -13,7 +15,10 @@ export type SidecarCapability =
   | 'clipboard'
   | 'screenshot'
   | 'system_info'
-  | 'awareness';
+  | 'awareness'
+  | 'windows'
+  | 'pebble'
+  | 'sub_pebble';
 
 /** A capability that is enabled in config but unavailable on the system */
 export interface UnavailableCapability {
@@ -38,6 +43,8 @@ export interface SidecarRecord {
   platform: string | null;
   /** JSON-encoded SidecarCapability[] — populated after first connection */
   capabilities: string | null;
+  /** Sidecar's own semver, reported on register ("dev" for local builds) */
+  version: string | null;
 }
 
 /** JWT claims for a sidecar enrollment token */
@@ -54,6 +61,13 @@ export interface SidecarTokenClaims {
   brain: string;
   /** URL to fetch the brain's JWKS public key */
   jwks: string;
+  /**
+   * Brain's anonymous telemetry id (see src/telemetry/anon-id.ts), so the
+   * sidecar can report which brain it belongs to without learning anything
+   * identifying. Absent on tokens issued before sidecar telemetry existed —
+   * those sidecars simply report no brain correlation until re-enrolled.
+   */
+  bid?: string;
   /** Issued-at timestamp */
   iat: number;
 }
@@ -64,6 +78,8 @@ export interface SidecarRegistration {
   hostname: string;
   os: string;
   platform: string;
+  /** Sidecar's own semver ("dev" for unstamped local builds) */
+  version?: string;
   capabilities: SidecarCapability[];
   unavailable_capabilities?: UnavailableCapability[];
 }
@@ -82,6 +98,10 @@ export interface ConnectedSidecar {
   hostname: string;
   os: string;
   platform: string;
+  /** Sidecar's own semver reported on register ("dev" for local builds) */
+  version: string;
+  /** Compatibility verdict the brain reached at register (never 'blocked' here — blocked sidecars never register) */
+  updateStatus: SidecarUpdateStatus;
   capabilities: SidecarCapability[];
   unavailableCapabilities: UnavailableCapability[];
   connectedAt: Date;
@@ -109,4 +129,8 @@ export interface SidecarInfo {
   platform?: string;
   capabilities?: SidecarCapability[];
   unavailable_capabilities?: UnavailableCapability[];
+  /** Sidecar's own semver (from the last connection; persisted) */
+  version?: string;
+  /** Compatibility verdict (only while connected): 'ok' | 'suggested' | 'dev' */
+  update_status?: SidecarUpdateStatus;
 }

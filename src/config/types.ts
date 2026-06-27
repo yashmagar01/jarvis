@@ -4,6 +4,16 @@ export type HeartbeatConfig = {
   aggressiveness: 'passive' | 'moderate' | 'aggressive';
 };
 
+/**
+ * System-level cron expressions. Published as `cron.<name>` events on the
+ * shared event bus so other subsystems can react instead of polling.
+ */
+export type SystemCronConfig = {
+  morning?: string;   // default "0 7 * * *"
+  evening?: string;   // default "0 20 * * *"
+  hourly?: string;    // default "37 * * * *"
+};
+
 export type GoogleConfig = {
   client_id: string;
   client_secret: string;
@@ -23,16 +33,73 @@ export type ChannelConfig = {
   };
 };
 
+export type WakeEngine = 'openwakeword' | 'webspeech' | 'auto';
+
+/**
+ * OpenAI realtime reasoning-effort ladder. Higher = more deliberate answers at
+ * the cost of latency and tokens. User-selectable in the Voice settings UI.
+ * Default is "low" (OpenAI's default for gpt-realtime-2).
+ */
+export type RealtimeReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
+/**
+ * Premium opt-in speech-to-speech voice via OpenAI's Realtime API
+ * (`gpt-realtime-2`). When enabled, the realtime session reuses the OpenAI
+ * provider configured under `llm.providers` (matched by `kind: 'openai'`) -
+ * there is no separate realtime key. When disabled (default) JARVIS uses the
+ * standard STT -> text LLM -> TTS pipeline.
+ *
+ * See docs/GPT_REALTIME_2_INTEGRATION.md.
+ */
+export type RealtimeVoiceConfig = {
+  /** Master opt-in. Default false. Env: JARVIS_REALTIME_VOICE. */
+  enabled: boolean;
+  /** Realtime model id. Default 'gpt-realtime-2'. */
+  model?: string;
+  /** OpenAI realtime voice id (e.g. 'marin', 'cedar'). */
+  voice?: string;
+  /** User-selectable reasoning effort (settings UI). Default 'low'. */
+  reasoning_effort?: RealtimeReasoningEffort;
+  /** Hard cap on a single realtime session length (cost guard). Default 10. */
+  max_session_minutes?: number;
+  /** Optional monthly USD spend ceiling; block new sessions past it. */
+  monthly_budget_usd?: number;
+  /**
+   * Action categories that stay BLOCKED even though realtime auto-approves
+   * everything else (safety backstop for destructive/irreversible tools).
+   * When unset, defaults to all `destructive`-impact categories (payments,
+   * deletes, shell exec, installs, settings changes, agent termination) so an
+   * open mic can't trigger them unattended — see DEFAULT_BLOCKED_CATEGORIES.
+   * Set to an explicit array (including `[]`) to override the default. Phase 3.
+   */
+  blocked_categories?: string[];
+};
+
+export type VoiceConfig = {
+  /**
+   * Wake-word engine used by the browser UI.
+   *  - "openwakeword": local on-device model (default, private).
+   *  - "webspeech":    browser SpeechRecognition (Chromium only; streams audio
+   *                    to the browser vendor's cloud for transcription).
+   *  - "auto":         prefer webspeech when available, fall back to openwakeword.
+   * Env: JARVIS_WAKE_ENGINE
+   */
+  wake_engine: WakeEngine;
+  /** Premium opt-in realtime speech-to-speech voice (gpt-realtime-2). */
+  realtime?: RealtimeVoiceConfig;
+};
+
 export type STTConfig = {
-  provider: 'openai' | 'groq' | 'local';
+  provider: 'openai' | 'groq' | 'local' | 'sarvam';
   openai?: { api_key: string; model?: string };
   groq?: { api_key: string; model?: string };
   local?: { endpoint: string; model?: string; server_type?: 'whisper_cpp' | 'openai_compatible' };
+  sarvam?: { api_key: string; model?: string; language?: string };
 };
 
 export type TTSConfig = {
   enabled: boolean;
-  provider?: 'edge' | 'elevenlabs';  // default: 'edge'
+  provider?: 'edge' | 'elevenlabs' | 'sarvam';  // default: 'edge'
   voice?: string;       // e.g. 'en-US-AriaNeural' (edge)
   rate?: string;        // e.g. '+0%', '+10%' (edge)
   volume?: string;      // e.g. '+0%' (edge)
@@ -42,6 +109,13 @@ export type TTSConfig = {
     model?: string;           // 'eleven_flash_v2_5' | 'eleven_multilingual_v2'
     stability?: number;       // 0-1
     similarity_boost?: number; // 0-1
+  };
+  sarvam?: {
+    api_key: string;
+    model?: string;
+    language?: string;
+    speaker?: string;
+    sampling_rate?: number;
   };
 };
 
@@ -69,7 +143,6 @@ export type AwarenessConfig = {
     full_hours: number;
     key_moment_hours: number;
   };
-  capture_dir: string;
 };
 
 export type PerActionOverride = {
@@ -128,13 +201,145 @@ export type UserConfig = {
   name?: string;
 };
 
+/**
+ * Anonymous usage telemetry. Opt-out model: enabled by default so the
+ * project can measure unique installs and retention. Disable with
+ * `enabled: false`, the `JARVIS_TELEMETRY=0` env var, or the community
+ * standard `DO_NOT_TRACK=1`.
+ */
+export type TelemetryConfig = {
+  enabled: boolean;
+};
+
+/**
+ * Onboarding completion state — persists in `~/.jarvis/config.yaml` so
+ * the dashboard knows which phase (setup / profile interview / tutorial)
+ * to show on next load. Each `*_completed_at` is a `Date.now()` stamp;
+ * `null` means not yet done. Reset endpoint clears subsets per scope.
+ *
+ * See `docs/ONBOARDING_PLAN.md` for the gate logic and reset semantics.
+ */
+export type OnboardingConfig = {
+  /** Phase A — LLM provider + key + model + TTS choice all saved. */
+  setup_completed_at: number | null;
+  /** Phase B opt-out — user clicked Skip on the profile interview. */
+  setup_skipped_profile?: boolean;
+  /** Phase C completion stamp. */
+  tutorial_completed_at: number | null;
+  /** Phase C dismissal stamp (one-shot snooze; user can replay). */
+  tutorial_dismissed_at?: number | null;
+  /** Resume key for an in-progress tutorial. */
+  tutorial_progress_step?: string;
+  /** Set by the reset endpoint — useful for debugging "did the reset
+   *  actually fire" or rate-limiting accidental resets later. */
+  last_reset_at?: number;
+};
+
+/**
+ * LLM provider classes that the system knows how to instantiate. The `kind`
+ * field on a provider entry selects one of these; the canonical default is
+ * the provider's name (the key in `providers`).
+ */
+export type LLMProviderKind =
+  | 'anthropic'
+  | 'openai'
+  | 'groq'
+  | 'gemini'
+  | 'ollama'
+  | 'openrouter'
+  | 'nvidia'
+  | 'openai_compatible'
+  | 'litellm';
+
+/**
+ * Credentials + endpoint for one provider instance. The `kind` field is
+ * optional; when absent, the key in `LLMConfig.providers` is assumed to be
+ * the provider class (e.g. `anthropic`). Specify `kind` explicitly when you
+ * want multiple instances of the same class (e.g. two ollama backends with
+ * different keys/URLs).
+ */
+export type LLMProviderEntry = {
+  /** Which provider class to use. Defaults to the map key. */
+  kind?: LLMProviderKind;
+  /** API key for cloud providers. */
+  api_key?: string;
+  /** Base URL for self-hosted / local providers (ollama, openai-compatible, litellm). */
+  base_url?: string;
+};
+
+/**
+ * Model reference string in the form "<provider-name>:<model-id>" where
+ * `provider-name` is a key in `LLMConfig.providers`. Examples:
+ *   "anthropic:claude-sonnet-4-6"
+ *   "openai:gpt-4o-mini"
+ *   "ollama:llama3"
+ *   "ollama-remote:qwen2.5"   (custom-named provider instance)
+ */
+export type LLMModelRef = string;
+
+export type LLMTiersConfig = {
+  conversation?: LLMModelRef;
+  high?: LLMModelRef;
+  medium?: LLMModelRef;
+  low?: LLMModelRef;
+};
+
+export type LLMConfig = {
+  /**
+   * Provider credentials, keyed by the name you reference them as in model
+   * strings. Set `kind` when you want a custom name (e.g. two ollama
+   * instances "ollama-local" + "ollama-remote", both with kind=ollama).
+   */
+  providers?: Record<string, LLMProviderEntry>;
+
+  /**
+   * Single-LLM mode model reference. When set and `tiers` is absent, all
+   * task tiers (low/medium/high) resolve to this model and the classic
+   * orchestrator runs. Ignored when `tiers` is configured.
+   */
+  default?: LLMModelRef;
+
+  /**
+   * Per-tier model map. This is the in-memory runtime representation, sourced
+   * EXCLUSIVELY from the DB (dashboard-managed) - it is NOT read from or
+   * written to config.yaml. Any `llm.tiers` block in config.yaml is discarded
+   * on load and stripped on save; only the single-LLM `default` may be set via
+   * the config file. The `conversation` tier switches the system into
+   * router-first mode (conv LLM delegates to task tiers); task tiers
+   * (low/medium/high) without an explicit assignment fall up.
+   */
+  tiers?: LLMTiersConfig;
+};
+
 export type JarvisConfig = {
   user?: UserConfig;
+  onboarding?: OnboardingConfig;
+  telemetry?: TelemetryConfig;
   daemon: {
     port: number;
     data_dir: string;
     db_path: string;
-    /** External domain for the brain (used in sidecar JWT tokens). Env: JARVIS_BRAIN_DOMAIN */
+    /**
+     * Canonical origin signed into sidecar enrollment JWTs as the `brain`
+     * (WebSocket) and `jwks` (public-key fetch) claims, so this is what the
+     * sidecar will keep using once enrolled.
+     *
+     * NOT the brain's bind address. If the brain is fronted by a reverse
+     * proxy or accessed across NAT, this must be the externally-reachable
+     * URL (e.g. `https://brain.example.com` or `wss://brain.example.com`),
+     * not the internal `localhost:PORT` the brain listens on.
+     *
+     * Accepts a full URL (`https://...`, `wss://...`) or a bare host[:port]
+     * (`brain.example.com`, `10.0.0.5:3142`). Bare local hosts default to
+     * ws/http; everything else defaults to wss/https.
+     *
+     * Precedence: `JARVIS_BRAIN_DOMAIN` env var > this field > internal
+     * `localhost:<port>` fallback (with a startup warning).
+     *
+     * Sidecars must be able to reach both derived endpoints from the
+     * enrolled machine, or JWKS fetch / WebSocket connect will fail until
+     * the token is re-issued with a reachable origin.
+     */
     brain_domain?: string;
   };
   auth?: AuthConfig;
@@ -142,18 +347,10 @@ export type JarvisConfig = {
   channels?: ChannelConfig;
   stt?: STTConfig;
   tts?: TTSConfig;
+  voice?: VoiceConfig;
   desktop?: DesktopConfig;
   awareness?: AwarenessConfig;
-  llm: {
-    primary: string;  // provider name
-    fallback: string[];
-    anthropic?: { api_key: string; model?: string };
-    openai?: { api_key: string; model?: string };
-    groq?: { api_key: string; model?: string };
-    gemini?: { api_key: string; model?: string };
-    ollama?: { base_url?: string; model?: string };
-    openrouter?: { api_key: string; model?: string };
-  };
+  llm: LLMConfig;
   personality: {
     core_traits: string[];
     assistant_name?: string;
@@ -170,12 +367,16 @@ export type JarvisConfig = {
   };
   authority: AuthorityConfig;
   heartbeat: HeartbeatConfig;
+  cron?: SystemCronConfig;
   active_role: string;  // role file name
 };
 
 export const DEFAULT_CONFIG: JarvisConfig = {
   user: {
     name: '',
+  },
+  telemetry: {
+    enabled: true,
   },
   daemon: {
     port: 3142,
@@ -195,6 +396,15 @@ export const DEFAULT_CONFIG: JarvisConfig = {
     voice: 'en-US-AriaNeural',
     rate: '+0%',
     volume: '+0%',
+  },
+  voice: {
+    wake_engine: 'openwakeword',
+    realtime: {
+      enabled: false,
+      model: 'gpt-realtime-2',
+      reasoning_effort: 'low',
+      max_session_minutes: 10,
+    },
   },
   desktop: {
     enabled: true,
@@ -218,35 +428,10 @@ export const DEFAULT_CONFIG: JarvisConfig = {
       full_hours: 1,
       key_moment_hours: 24,
     },
-    capture_dir: '~/.jarvis/captures',
   },
   llm: {
-    primary: 'anthropic',
-    fallback: ['openai', 'ollama'],
-    anthropic: {
-      api_key: '',
-      model: 'claude-sonnet-4-6',
-    },
-    openai: {
-      api_key: '',
-      model: 'gpt-5.4',
-    },
-    groq: {
-      api_key: '',
-      model: 'llama-3.3-70b-versatile',
-    },
-    gemini: {
-      api_key: '',
-      model: 'gemini-3-flash-preview',
-    },
-    ollama: {
-      base_url: 'http://localhost:11434',
-      model: 'llama3',
-    },
-    openrouter: {
-      api_key: '',
-      model: 'anthropic/claude-sonnet-4',
-    },
+    providers: {},
+    tiers: {},
   },
   personality: {
     core_traits: [

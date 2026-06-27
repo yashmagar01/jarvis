@@ -6,12 +6,15 @@ out
 dist
 *.tgz
 
+# Built Jarvis piece artifacts (created by scripts/build-pieces.ts)
+src/workflows/activepieces/packages/pieces/jarvis/*/dist/
+
 # code coverage
 coverage
 *.lcov
 
 # logs
-logs
+/logs
 _.log
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
@@ -52,3 +55,10 @@ sidecar/desktop-bridge/bin/
 sidecar/desktop-bridge/obj/
 
 eng.traineddata
+
+# install-method marker — written at install time, never committed
+.install-method
+
+# Ignore agent files
+CLAUDE.md
+AGENTS.md

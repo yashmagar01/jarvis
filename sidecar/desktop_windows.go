@@ -207,7 +207,10 @@ func handleLaunchApp(params map[string]any) (*RPCResult, error) {
 	if executable == "" {
 		return nil, fmt.Errorf("missing required parameter: executable")
 	}
-	args, _ := params["args"].(string)
+	args, err := extractArgs(params)
+	if err != nil {
+		return nil, fmt.Errorf("launch_app: %w", err)
+	}
 
 	escaped := strings.ReplaceAll(executable, "'", "''")
 	argsClause := ""
@@ -304,6 +307,7 @@ func runPS(script string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-Command", script)
+	hideSubprocessWindow(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err

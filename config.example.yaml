@@ -5,6 +5,11 @@ daemon:
   port: 3142
   data_dir: "~/.jarvis"
   db_path: "~/.jarvis/jarvis.db"
+  # Public origin written into sidecar enrollment JWTs (`brain` + `jwks`).
+  # For remote sidecars, set this to the externally reachable URL/host they
+  # can actually reach, not localhost or a private/container-only hostname.
+  # Env override: JARVIS_BRAIN_DOMAIN="https://brain.example.com"
+  # brain_domain: "https://brain.example.com"
 
 # Authentication — protects dashboard, API, and WebSocket.
 # If unset, the application is open (no auth).
@@ -12,39 +17,22 @@ daemon:
 # auth:
 #   token: "your-secret-token-here"
 
-llm:
-  # Primary provider to use
-  primary: "anthropic"
+# Anonymous usage metrics (opt-out, enabled by default).
+# Sends a tiny anonymous ping at startup and every hour so the project can
+# count unique installs and retention. No personal data, config, or content —
+# just a hashed machine id, app version, install method, and OS.
+# See docs/TELEMETRY.md for exactly what is collected.
+# Disable here, or via JARVIS_TELEMETRY=0, or DO_NOT_TRACK=1.
+telemetry:
+  enabled: true
 
-  # Fallback providers (tried in order if primary fails)
-  fallback:
-    - "openai"
-    - "ollama"
-
-  # Anthropic (Claude) configuration
-  anthropic:
-    api_key: "sk-ant-..."
-    model: "claude-sonnet-4-5-20250929"
-
-  # OpenAI (GPT) configuration
-  openai:
-    api_key: "sk-..."
-    model: "gpt-4o"
-
-  # Groq (OpenAI-compatible) configuration
-  # groq:
-  #   api_key: "gsk_..."
-  #   model: "llama-3.3-70b-versatile"
-
-  # OpenRouter (access hundreds of models via single API key)
-  # openrouter:
-  #   api_key: "sk-or-..."
-  #   model: "anthropic/claude-sonnet-4"
-
-  # Ollama (local models) configuration
-  ollama:
-    base_url: "http://localhost:11434"
-    model: "llama3"
+# ── LLM configuration ──
+# There is NO LLM config in this file. Providers, credentials, the single-LLM
+# default, and per-tier routing are all configured from the settings dashboard
+# (http://localhost:3142, Settings > LLM) and stored in the database +
+# encrypted keychain. Any `llm:` block added here is ignored on load and
+# stripped on save. Env vars (JARVIS_OPENAI_KEY, etc.) are no longer read for
+# LLM config either.
 
 personality:
   core_traits:
@@ -63,6 +51,14 @@ authority:
   # 4: System changes
   # 5: Full control
   default_level: 3
+
+# System cron triggers. Each fires `cron.<name>` on the shared event bus.
+# Phase 2 will hook the goal system + commitment executor onto these so the
+# 15-minute heartbeat poll can be removed. Defaults shown below.
+# cron:
+#   morning: "0 7 * * *"   # 7am local
+#   evening: "0 20 * * *"  # 8pm local
+#   hourly:  "37 * * * *"  # every hour at :37
 
 # Text-to-Speech (voice output)
 tts:

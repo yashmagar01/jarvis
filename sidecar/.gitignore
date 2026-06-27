@@ -1,7 +1,9 @@
 # Build output
 dist/
-/jarvis-sidecar
-/jarvis-sidecar.exe
+/jarvis
+/jarvis.exe
+/jarvis-test
+/jarvis-test.exe
 /sidecar
 
 # npm platform package binaries (built by make npm-pack)
@@ -14,3 +16,6 @@ npm/win32-x64/bin/
 
 # Tester binaries (built by make test)
 tester/bin/tester_*
+
+# macOS Vision OCR helper (built by `make build-ocr-helper` on a Mac)
+helpers/ocr-helper

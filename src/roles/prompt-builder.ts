@@ -36,54 +36,50 @@ export function buildSystemPrompt(role: RoleDefinition, context?: PromptContext)
   }
   sections.push('');
 
-  // Autonomous Actions
-  sections.push('# Autonomous Actions (do without asking)');
-  if (role.autonomous_actions.length > 0) {
+  // Autonomous Actions (only if present and non-empty)
+  if (role.autonomous_actions && role.autonomous_actions.length > 0) {
+    sections.push('# Autonomous Actions (do without asking)');
     for (const action of role.autonomous_actions) {
       sections.push(`- ${action}`);
     }
-  } else {
-    sections.push('- None. Always ask for permission before taking any action.');
+    sections.push('');
   }
-  sections.push('');
 
-  // Approval Required
-  sections.push('# Approval Required (always ask first)');
-  if (role.approval_required.length > 0) {
+  // Approval Required (only if present and non-empty)
+  if (role.approval_required && role.approval_required.length > 0) {
+    sections.push('# Approval Required (always ask first)');
     for (const action of role.approval_required) {
       sections.push(`- ${action}`);
     }
-  } else {
-    sections.push('- N/A');
+    sections.push('');
   }
-  sections.push('');
 
-  // Communication Style
-  sections.push('# Communication Style');
-  sections.push(`Tone: ${role.communication_style.tone}.`);
-  sections.push(`Verbosity: ${role.communication_style.verbosity}.`);
-  sections.push(`Formality: ${role.communication_style.formality}.`);
-  sections.push('');
+  // Communication Style (only if present)
+  if (role.communication_style) {
+    sections.push('# Communication Style');
+    sections.push(`Tone: ${role.communication_style.tone}. Verbosity: ${role.communication_style.verbosity}. Formality: ${role.communication_style.formality}.`);
+    sections.push('');
+  }
+  // Task-acknowledgment rule is universal (not role-specific) - keep it.
   sections.push('**Task Acknowledgment**: When asked to perform a task that requires tool use, ALWAYS give a brief acknowledgment first (e.g., "On it.", "Let me check.", "I\'ll look into that.") before using any tools. Never silently start executing tools — the user should know you understood their request.');
   sections.push('');
 
-  // KPIs
-  sections.push('# Key Performance Indicators (KPIs)');
-  if (role.kpis.length > 0) {
-    sections.push('| KPI | Metric | Target | Check Interval |');
-    sections.push('|-----|--------|--------|----------------|');
+  // KPIs (only if present and non-empty) - rarely load-bearing, slim form.
+  if (role.kpis && role.kpis.length > 0) {
+    sections.push('# Key Performance Indicators');
     for (const kpi of role.kpis) {
-      sections.push(`| ${kpi.name} | ${kpi.metric} | ${kpi.target} | ${kpi.check_interval} |`);
+      sections.push(`- ${kpi.name}: ${kpi.metric} (target: ${kpi.target})`);
     }
-  } else {
-    sections.push('- No specific KPIs defined.');
+    sections.push('');
   }
-  sections.push('');
 
-  // Heartbeat Instructions
-  sections.push('# Heartbeat Instructions');
-  sections.push(role.heartbeat_instructions);
-  sections.push('');
+  // Heartbeat Instructions (only if present) - dead with the heartbeat removal,
+  // but kept for roles that may still want to inject behavior text.
+  if (role.heartbeat_instructions) {
+    sections.push('# Heartbeat Instructions');
+    sections.push(role.heartbeat_instructions);
+    sections.push('');
+  }
 
   // Available Tools
   sections.push('# Available Tools');
@@ -94,15 +90,20 @@ export function buildSystemPrompt(role: RoleDefinition, context?: PromptContext)
   } else {
     sections.push('- No tools assigned.');
   }
+  // `request_approval` is always available to every primary agent, regardless
+  // of role.tools. Exposing it here (and reinforcing in Intent Gating below)
+  // keeps the LLM from concluding it isn't "in configuration" when it only
+  // glances at this list.
+  sections.push('- request_approval (authority) — always available; see Intent Gating below');
   sections.push('');
 
-  // Sub-roles (if any)
-  if (role.sub_roles.length > 0) {
+  // Sub-roles (only if present and non-empty). Static role-level sub_roles are
+  // largely advisory - the actual available specialist list comes from the
+  // dynamic context.availableSpecialists block below.
+  if (role.sub_roles && role.sub_roles.length > 0) {
     sections.push('# Sub-Roles You Can Spawn');
     for (const subRole of role.sub_roles) {
       sections.push(`- **${subRole.name}** (${subRole.role_id}): ${subRole.description}`);
-      sections.push(`  - Reports to: ${subRole.reports_to}`);
-      sections.push(`  - Max budget per task: ${subRole.max_budget_per_task}`);
     }
     sections.push('');
   }
@@ -124,6 +125,36 @@ export function buildSystemPrompt(role: RoleDefinition, context?: PromptContext)
     sections.push('When a tool returns [AUTHORITY DENIED], explain that you lack permission and suggest alternatives.');
     sections.push('');
   }
+
+  // Intent Gating — semantic approval layer above tool-name-based gating.
+  // This section must stay visible in every agent prompt, even when no
+  // authority rules are configured, because the LLM can always accomplish
+  // a gated action by composing lower-level tools (browser, desktop).
+  sections.push('# Intent Gating (ALWAYS FOLLOW)');
+  sections.push('');
+  sections.push('**`request_approval` is always available to you.** It is a built-in system tool registered on every primary agent, independent of the Available Tools list above. Do not say "the approval tool isn\'t available" — it is. Call it like any other tool.');
+  sections.push('');
+  sections.push('Before performing any of the following **gated actions**, you MUST call the `request_approval` tool first, and wait for it to return `[APPROVED]` before proceeding:');
+  sections.push('');
+  sections.push('- **send_email** — sending an email to anyone');
+  sections.push('- **send_message** — sending a message in any channel (Slack, Telegram, Discord, SMS, chat apps, etc.)');
+  sections.push('- **make_payment** — any financial transaction, purchase, or subscription');
+  sections.push('- **install_software** — installing, upgrading, or removing any package or app');
+  sections.push('- **modify_settings** — changing system or account settings');
+  sections.push('- **delete_data** — deleting files, records, or persistent state');
+  sections.push('- **execute_command** — running shell commands that mutate state (git push, rm, npm install, docker run, etc.)');
+  sections.push('- **terminate_agent** — stopping a running agent');
+  sections.push('');
+  sections.push('This rule applies **regardless of which lower-level tools you plan to use**. Example: if you intend to click the Send button in Gmail via `browser_click`, you MUST call `request_approval` with `action_category: "send_email"` FIRST.');
+  sections.push('');
+  sections.push('Rules:');
+  sections.push('1. Call `request_approval` with a clear `intent` sentence (e.g. `"Send email to alice@example.com with subject Weekly Update"`).');
+  sections.push('2. If it returns `[APPROVED]`, proceed with the action immediately. Do not ask again.');
+  sections.push('3. If it returns `[DENIED]`, STOP. Tell the user briefly that the action was blocked.');
+  sections.push('4. If it returns `[EXPIRED]` or `[PENDING]`, ask the user directly whether to proceed.');
+  sections.push('5. NEVER write "APPROVAL REQUIRED", "Do you approve?", or any similar pseudo-approval message yourself. Always use the tool — the tool is what shows the real approval card to the user.');
+  sections.push('6. Read-only actions (reading files, browsing info pages, running `ls`, checking status) do NOT need `request_approval`.');
+  sections.push('');
 
   // Tool Guide (static reference, sidecar section conditional)
   sections.push(buildToolGuide(context?.hasSidecars ?? false));

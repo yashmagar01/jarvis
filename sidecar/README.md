@@ -15,6 +15,34 @@ GOOS=darwin  go build -o jarvis-sidecar-macos .
 GOOS=windows go build -o jarvis-sidecar.exe .
 ```
 
+### Panel service prerequisites (Phase 2 ambient UX)
+
+The sidecar can spawn native panel windows (frameless, always-on-top, transparent, click-through) via `github.com/webview/webview_go`. This requires a system webview runtime per platform:
+
+| Platform | Runtime | Install |
+|---|---|---|
+| Windows 11 | WebView2 (Edge Chromium) | Pre-installed on Win11; on Win10 see [WebView2 runtime](https://developer.microsoft.com/microsoft-edge/webview2/) |
+| macOS | WKWebView | Pre-installed (system) |
+| Linux | WebKitGTK 4.1 | see "Linux setup" below |
+
+#### Linux setup (Ubuntu 22.04/24.04 + WSL)
+
+```bash
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential pkg-config
+
+# webview_go's cgo line hardcodes pkg-config name webkit2gtk-4.0, but Noble
+# only ships 4.1. Symlink the .pc files so build-time pkg-config resolves
+# (the webview.h runtime loader already prefers libwebkit2gtk-4.1.so).
+sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.1.pc \
+            /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.0.pc
+sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/javascriptcoregtk-4.1.pc \
+            /usr/lib/x86_64-linux-gnu/pkgconfig/javascriptcoregtk-4.0.pc
+```
+
+WSL note: WebKitGTK runs but the panel window appears on the WSL X server, not Windows directly. For real-world dev/test, build for Windows and run natively on Win11.
+
+Cross-compilation with cgo: the panel service uses cgo, so cross-compiling needs the target's webview headers available. For Windows builds from Linux, the simplest path is to build natively on Windows; for macOS, build on a Mac.
+
 ## Usage
 
 ```bash

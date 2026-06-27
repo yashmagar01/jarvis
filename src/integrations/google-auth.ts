@@ -9,6 +9,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import { readFileSync, existsSync } from 'node:fs';
+import { secureParentDirectory, secureWriteFile } from '../util/fs-secure.ts';
 
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
@@ -62,7 +63,8 @@ export class GoogleAuth {
    */
   async saveTokens(tokens: GoogleTokens): Promise<void> {
     this.tokens = tokens;
-    await Bun.write(this.tokensPath, JSON.stringify(tokens, null, 2));
+    await secureParentDirectory(this.tokensPath);
+    await secureWriteFile(this.tokensPath, JSON.stringify(tokens, null, 2), 0o600, 'GoogleAuth');
   }
 
   /**
@@ -70,6 +72,16 @@ export class GoogleAuth {
    */
   isAuthenticated(): boolean {
     return this.tokens !== null && !!this.tokens.refresh_token;
+  }
+
+  /**
+   * Snapshot of the current token set, or `null` if not authenticated.
+   * Returned by value (caller can't mutate the internal cache). Used by
+   * `JarvisGoogleConnectionSource` to surface the full OAuth2-shaped value
+   * (access_token + refresh_token + expiry_date) to pieces.
+   */
+  getTokens(): GoogleTokens | null {
+    return this.tokens ? { ...this.tokens } : null;
   }
 
   /**

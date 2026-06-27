@@ -7,7 +7,12 @@
 import type { SidecarEvent, EventPriority } from './protocol.ts';
 
 // Size limits
-export const MAX_JSON_SIZE = 1 * 1024 * 1024;       // 1 MB
+// Large binaries (screenshots, region captures, audio segments) are sent in a
+// separate WebSocket binary frame via the ref protocol once they reach
+// BINARY_INLINE_THRESHOLD, so the JSON message itself stays small. This cap
+// only needs to cover inline (<256 KB) binaries plus JSON result text, with
+// headroom for base64 expansion — not full-resolution images.
+export const MAX_JSON_SIZE = 2 * 1024 * 1024;        // 2 MB
 export const MAX_BINARY_SIZE = 50 * 1024 * 1024;     // 50 MB
 export const BINARY_INLINE_THRESHOLD = 256 * 1024;   // 256 KB
 export const BINARY_REF_ID_LENGTH = 36;               // UUID length

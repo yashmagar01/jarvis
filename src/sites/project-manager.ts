@@ -10,6 +10,7 @@ import { TEMPLATES, generateMakefile, scaffoldBunReact } from './templates.ts';
 import { join, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { readdirSync, statSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { isWithin } from '../util/path.ts';
 
 const META_FILE = '.jarvis-project.json';
 
@@ -309,14 +310,14 @@ export class ProjectManager {
     const projectPath = join(this.projectsDir, id);
     // Prevent path traversal
     const resolved = resolve(projectPath);
-    if (!resolved.startsWith(resolve(this.projectsDir))) return null;
+    if (!isWithin(resolved, resolve(this.projectsDir))) return null;
     if (!existsSync(resolved)) return null;
     return resolved;
   }
 
   private safeJoin(projectPath: string, relativePath: string): string {
     const resolved = resolve(join(projectPath, relativePath));
-    if (!resolved.startsWith(resolve(projectPath))) {
+    if (!isWithin(resolved, resolve(projectPath))) {
       throw new Error('Path traversal attempt blocked');
     }
     return resolved;

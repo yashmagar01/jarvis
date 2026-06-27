@@ -170,13 +170,39 @@ export function buildToolGuide(hasSidecars: boolean): string {
   lines.push('OKR-style goal management (create, list, score, decompose, morning plan, evening review).');
   lines.push('');
   lines.push('### manage_workflow');
-  lines.push('Create and run automation workflows from natural language.');
+  lines.push('Create, run, and manage Jarvis workflows (automations).');
+  lines.push('When the user says "make a workflow that ...", "automate X", "set up a flow for Y", reach for this tool.');
+  lines.push('');
+  lines.push('Primary action: `compose { name, description }` builds a draft flow from a plain-English description.');
+  lines.push('The action calls the LLM under the hood, validates against the piece catalog, and either persists a');
+  lines.push('DISABLED draft or returns `{ ok: false, errors, rawResponse }`. Treat failures as iterative: read the errors,');
+  lines.push('refine the description with concrete piece/tool names from the messages, and call `compose` again.');
+  lines.push('Do not surface raw error JSON to the user, translate it. After a successful compose, summarize what was');
+  lines.push('built and confirm with the user before calling `publish` (which locks the draft and enables it).');
+  lines.push('');
+  lines.push('Use `create { name, empty: true }` ONLY when the user explicitly asked for a blank canvas to edit by hand in the UI.');
+  lines.push('The tool rejects `create` without `empty: true` (or a `description`) -- this is intentional, to stop weak models from');
+  lines.push('picking `create` just because the verb matches. If you pass `description`, the call silently reroutes to `compose`.');
+  lines.push('Use `run { flow, payload? }` to trigger an existing flow; `flow` accepts display name or id.');
+  lines.push('Sub-actions: compose / create / list / get / run / enable / disable / publish / delete / list_runs / get_run.');
   lines.push('');
   lines.push('### delegate_task');
   lines.push('Send a task to a specialist sub-agent (research analyst, software engineer, etc.). The specialist works independently and returns results.');
   lines.push('');
   lines.push('### manage_agents');
   lines.push('Manage persistent background agents for long-running tasks.');
+  lines.push('');
+
+  // --- Authority / intent gating ---
+  lines.push('## Authority Gating');
+  lines.push('');
+  lines.push('### request_approval');
+  lines.push('**Required BEFORE any gated semantic action.** Creates an inline approval card for the user. Blocks until they decide, then returns `[APPROVED]` / `[DENIED]` / `[EXPIRED]`.');
+  lines.push('- `action_category` (required): one of `send_email`, `send_message`, `make_payment`, `install_software`, `modify_settings`, `delete_data`, `execute_command`, `terminate_agent`');
+  lines.push('- `intent` (required): a short imperative sentence, e.g. `"Send email to alice@example.com with subject Weekly Update"`');
+  lines.push('- `context` (optional): 1–2 sentence rationale');
+  lines.push('');
+  lines.push('Call this BEFORE you start composing/clicking/running — not after. See the "Intent Gating" section of the system prompt for when it is required.');
   lines.push('');
 
   // --- Other ---

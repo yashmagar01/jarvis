@@ -1,0 +1,1984 @@
+/* WorkflowEditor — full-screen overlay with @xyflow canvas + properties panel. */
+
+.wf-editor {
+  /* Leave the Jarvis voice rail (right column of the AppShell) uncovered
+     so the user keeps access to the orb / suggestions while editing a
+     workflow. The rail width is the same token RoomShell uses for its own
+     overlay. */
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: var(--v2-rail-width);
+  background: var(--paper);
+  display: flex;
+  flex-direction: column;
+  z-index: 100;
+  /* Workflow editor design tokens. Centralised here so the handle / edge
+     palette flows from one place rather than being scattered across many
+     selectors. Falls back to the global rule-soft / ink-3 if no value is
+     present so the editor still renders on themes that don't define these. */
+  --wf-edge-stroke: var(--ink-3);
+  --wf-edge-stroke-selected: var(--accent);
+  --wf-handle-bg: var(--paper-2);
+  --wf-handle-border: var(--ink-3);
+  --wf-handle-border-hover: var(--accent);
+  /* Hit target (the actual <Handle/> div). Generous so the user doesn't
+     have to aim at a pixel-perfect dot when starting a connection. */
+  --wf-handle-size: 24px;
+  /* Visible dot painted by the ::after pseudo-element, centred inside
+     the hit area. Smaller than the hit target so the chrome reads as
+     "small circle" while the click area stays forgiving. */
+  --wf-handle-dot: 10px;
+}
+
+.wf-editor__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-5);
+  border-bottom: 1px solid var(--rule-soft);
+  background: var(--paper-2);
+  flex-shrink: 0;
+}
+
+.wf-editor__title h2 {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--ink);
+}
+
+/* Click-to-edit title. The h2 reads as a button (cursor + subtle hover
+   tint) when the version is editable; we keep the visual chrome identical
+   to a non-editable title so the affordance shows on hover, not at rest. */
+.wf-editor__title-text {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--ink);
+  cursor: text;
+  padding: 2px 6px;
+  margin-left: -6px;
+  border-radius: var(--r-2);
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wf-editor__title-text:hover {
+  background: var(--paper-3);
+}
+.wf-editor__title-text:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.wf-editor__title-text--locked {
+  cursor: default;
+}
+.wf-editor__title-text--locked:hover {
+  background: transparent;
+}
+
+/* Input variant: matches the h2's font + sizing so the swap doesn't
+   produce a visual jump. */
+.wf-editor__title-input {
+  margin: 0;
+  margin-left: -6px;
+  font-size: 1rem;
+  font-family: inherit;
+  color: var(--ink);
+  background: var(--paper-3);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-2);
+  padding: 2px 6px;
+  outline: none;
+  min-width: 200px;
+  max-width: 480px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.wf-editor__title p {
+  margin: 2px 0 0;
+  font-size: 0.78rem;
+  color: var(--ink-3);
+}
+.wf-editor__title code {
+  background: var(--paper-3);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.wf-editor__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.wf-editor__toast {
+  font-size: 0.8rem;
+  padding: 4px 10px;
+  border-radius: var(--r-2);
+  border: 1px solid var(--rule-soft);
+  background: var(--paper-3);
+}
+.wf-editor__toast--ok { color: var(--accent-ok, #5eead4); border-color: var(--accent-ok-soft, #134e4a); }
+.wf-editor__toast--warn { color: var(--accent-warn, #fbbf24); border-color: var(--accent-warn-soft, #713f12); }
+
+/* ── Run overlay banner ───────────────────────────────────────────────
+   Surfaced below the running banner when the user clicks "Show on
+   canvas" on a past run. Distinct visual treatment from the running
+   banner because they can both be present at once (live run going while
+   user inspects a different past run). */
+.wf-editor__overlay-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 6px var(--s-5);
+  border-bottom: 1px solid var(--rule-soft);
+  background: color-mix(in srgb, var(--accent) 8%, var(--paper-2));
+  border-bottom-color: color-mix(in srgb, var(--accent) 30%, var(--rule-soft));
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  color: var(--ink);
+}
+.wf-editor__overlay-banner code {
+  background: var(--paper-3);
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 0.72rem;
+}
+.wf-editor__overlay-banner-icon {
+  display: inline-flex;
+  align-items: center;
+  width: 18px;
+  height: 18px;
+  color: var(--accent);
+}
+.wf-editor__overlay-banner--ok .wf-editor__overlay-banner-icon { color: var(--ok); }
+.wf-editor__overlay-banner--warn .wf-editor__overlay-banner-icon { color: var(--warn); }
+.wf-editor__overlay-banner--accent .wf-editor__overlay-banner-icon { color: var(--accent); }
+.wf-editor__overlay-banner-text {
+  flex: 1 1 auto;
+}
+.wf-editor__overlay-banner-clear {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-pill);
+  padding: 2px 10px;
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  color: var(--ink-2);
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.wf-editor__overlay-banner-clear:hover {
+  background: var(--paper-3);
+  color: var(--ink);
+}
+
+/* ── Run-detail popover (overlay mode) ─────────────────────────────────
+   Shown when the user clicks a node while a past run is overlaid. Lives
+   over the canvas via portal; positioned by JS-clamp. Read-only view
+   of one step's input/output/error/duration. */
+.wf-run-detail {
+  position: fixed;
+  z-index: 200;
+  width: 380px;
+  max-height: min(70vh, 560px);
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  box-shadow: 0 12px 40px -8px rgba(0, 0, 0, 0.5),
+              0 4px 12px -4px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+}
+
+.wf-run-detail__header {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 6px var(--s-3);
+  border-bottom: 1px solid var(--rule-soft);
+  background: var(--paper-2);
+  font-family: var(--font-sans);
+  font-size: 0.78rem;
+}
+.wf-run-detail__header code {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  background: var(--paper-3);
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: var(--ink);
+}
+.wf-run-detail__header--ok { border-bottom-color: color-mix(in srgb, var(--ok) 35%, var(--rule-soft)); }
+.wf-run-detail__header--warn { border-bottom-color: color-mix(in srgb, var(--warn) 35%, var(--rule-soft)); }
+.wf-run-detail__header--accent { border-bottom-color: color-mix(in srgb, var(--accent) 35%, var(--rule-soft)); }
+.wf-run-detail__status {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  color: var(--ink-2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wf-run-detail__duration {
+  color: var(--ink-3);
+  font-weight: 400;
+}
+.wf-run-detail__close {
+  background: transparent;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-pill);
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.wf-run-detail__close:hover { background: var(--paper-3); color: var(--ink); }
+
+.wf-run-detail__body {
+  overflow-y: auto;
+  padding: var(--s-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+.wf-run-detail__empty {
+  padding: var(--s-4);
+  text-align: center;
+  font-size: 0.82rem;
+  color: var(--ink-3);
+  font-style: italic;
+}
+.wf-run-detail__section h4 {
+  margin: 0 0 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.wf-run-detail__section pre {
+  margin: 0;
+  padding: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: var(--ink);
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* Error section gets a tinted accent left rule so it's the first thing
+   the eye lands on when a step failed. */
+.wf-run-detail__section--error pre {
+  background: color-mix(in srgb, var(--accent) 6%, var(--paper-2));
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--rule-soft));
+  color: var(--accent);
+}
+
+/* ── Per-node run status (overlay mode) ────────────────────────────────
+   Painted by `wf-node--run-<status>` modifier classes. Applied alongside
+   the regular border / unconfigured / orphan modifiers; the run colors
+   take precedence by being later in the cascade. */
+.wf-node--run-succeeded { border-color: var(--ok); box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 30%, transparent); }
+.wf-node--run-failed    { border-color: var(--accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+.wf-node--run-paused    { border-color: var(--warn); box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 30%, transparent); }
+.wf-node--run-running   { border-color: var(--warn); box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 30%, transparent); animation: wf-node-run-pulse 1.6s ease-in-out infinite; }
+.wf-node--run-skipped   { opacity: 0.6; }
+.wf-node--run-not-reached { opacity: 0.4; filter: grayscale(60%); }
+
+@keyframes wf-node-run-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 30%, transparent); }
+  50%      { box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 30%, transparent); }
+}
+
+/* Small status pip on the right side of the node's head row. */
+.wf-node__run-pip {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-left: auto;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.wf-node__run-pip--succeeded { background: var(--ok); }
+.wf-node__run-pip--failed    { background: var(--accent); }
+.wf-node__run-pip--paused    { background: var(--warn); }
+.wf-node__run-pip--running   { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 30%, transparent); }
+.wf-node__run-pip--skipped   { background: var(--ink-3); }
+
+/* ── Sticky "currently running" banner ─────────────────────────────────
+   Renders just below the editor header when any run is non-terminal.
+   Whole bar is a button -- click jumps the user into the runs panel. */
+.wf-editor__running-banner {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  align-items: center;
+  gap: var(--s-3);
+  width: 100%;
+  padding: 6px var(--s-5);
+  border: 0;
+  border-bottom: 1px solid var(--rule-soft);
+  background: var(--paper-2);
+  color: var(--ink);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  text-align: left;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.wf-editor__running-banner:hover { background: var(--paper-3); }
+.wf-editor__running-banner:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Tone variants. `warn` is the common in-flight case (RUNNING / PAUSED);
+   `neutral` covers QUEUED before a startTime exists. */
+.wf-editor__running-banner--warn {
+  background: color-mix(in srgb, var(--warn) 10%, var(--paper-2));
+  border-bottom-color: color-mix(in srgb, var(--warn) 35%, var(--rule-soft));
+}
+.wf-editor__running-banner--warn:hover {
+  background: color-mix(in srgb, var(--warn) 16%, var(--paper-2));
+}
+
+.wf-editor__running-banner-icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--warn);
+}
+
+/* Soft pulsing ring on the icon while a run is actively RUNNING -- gives
+   the banner a heartbeat so users notice the live state without us
+   having to spin a constant animation. */
+.wf-editor__running-banner-pulse {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--warn) 45%, transparent);
+  animation: wf-banner-pulse 1.4s ease-out infinite;
+  pointer-events: none;
+}
+@keyframes wf-banner-pulse {
+  0%   { transform: scale(0.6); opacity: 0.7; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+.wf-editor__running-banner-text {
+  font-size: 0.82rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.wf-editor__running-banner-duration {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.wf-editor__running-banner-cta {
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.wf-editor__running-banner:hover .wf-editor__running-banner-cta {
+  color: var(--ink);
+}
+
+/* Body: horizontal split between the xyflow canvas and the (optional)
+   right-side runs panel. The canvas takes whatever's left after the
+   panel's fixed width. */
+.wf-editor__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  overflow: hidden;
+}
+
+.wf-editor__canvas {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+  background: var(--paper);
+  overflow: hidden;
+}
+
+/* ── Runs panel (right side of the editor) ─────────────────────────────── */
+
+.wf-editor__runs-panel {
+  flex: 0 0 320px;
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--rule-soft);
+  background: var(--paper-2);
+  overflow: hidden;
+}
+
+.wf-editor__runs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border-bottom: 1px solid var(--rule-soft);
+  background: var(--paper);
+}
+
+.wf-editor__runs-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--ink);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.wf-editor__runs-meta {
+  font-weight: 400;
+  font-size: 0.7rem;
+  color: var(--ink-3);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.wf-editor__runs-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.wf-editor__runs-error {
+  padding: var(--s-2) var(--s-3);
+  font-size: 0.75rem;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.wf-editor__runs-empty {
+  padding: var(--s-4);
+  text-align: center;
+  color: var(--ink-3);
+  font-size: 0.82rem;
+}
+
+.wf-editor__runs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+
+.wf-editor__run {
+  border-bottom: 1px solid var(--rule-soft);
+}
+
+.wf-editor__run-head {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: var(--s-2) var(--s-3);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-sans);
+  font-size: 0.78rem;
+  color: var(--ink);
+}
+.wf-editor__run-head:hover { background: var(--paper-3); }
+
+.wf-editor__run-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+}
+
+.wf-editor__run-status {
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+.wf-editor__run-failed {
+  grid-column: 2 / 3;
+  font-size: 0.7rem;
+  color: var(--accent);
+  font-style: italic;
+}
+
+.wf-editor__run-time,
+.wf-editor__run-duration {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+/* Status color accents on the run icon. Picks the matching ink color so
+   the row's status word also reads in tone. */
+.wf-editor__run--ok .wf-editor__run-icon { color: var(--ok); }
+.wf-editor__run--warn .wf-editor__run-icon { color: var(--warn); }
+.wf-editor__run--accent .wf-editor__run-icon { color: var(--accent); }
+.wf-editor__run--neutral .wf-editor__run-icon { color: var(--ink-3); }
+
+/* One-line error preview under the row's status line. Always rendered
+   when a failed step has a message; tooltip carries the full thing. */
+.wf-editor__run-error {
+  margin: 0;
+  padding: 0 var(--s-3) 6px;
+  font-size: 0.72rem;
+  color: var(--accent);
+  line-height: 1.35;
+  /* Clamp to 2 lines so a verbose error doesn't blow up the row. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.wf-editor__run-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 var(--s-3) 6px;
+  gap: 4px;
+}
+
+/* Highlighted run row when its overlay is active on the canvas. */
+.wf-editor__run--overlay-active {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.wf-editor__run-body {
+  padding: var(--s-2) var(--s-3) var(--s-3);
+  border-top: 1px dashed var(--rule-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  background: var(--paper);
+}
+
+.wf-editor__run-kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px var(--s-2);
+  margin: 0;
+  font-size: 0.72rem;
+}
+.wf-editor__run-kv dt { color: var(--ink-3); }
+.wf-editor__run-kv dd { margin: 0; color: var(--ink-2); }
+.wf-editor__run-kv code {
+  background: var(--paper-3);
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 0.68rem;
+}
+
+.wf-editor__run-output summary {
+  cursor: pointer;
+  font-size: 0.72rem;
+  color: var(--ink-2);
+  padding: 2px 0;
+}
+.wf-editor__run-output pre {
+  margin: 4px 0 0;
+  padding: var(--s-2);
+  background: var(--paper-2);
+  color: var(--ink);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Header chips for the Runs button: small badge for active runs (accent)
+   vs a quiet count when everything's terminal. */
+.wf-editor__runs-badge,
+.wf-editor__runs-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 4px;
+  border-radius: var(--r-pill);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 500;
+}
+.wf-editor__runs-badge {
+  background: var(--accent);
+  color: var(--paper);
+}
+.wf-editor__runs-count {
+  background: var(--paper-3);
+  color: var(--ink-2);
+  border: 1px solid var(--rule-soft);
+}
+
+.wf-editor__placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--ink-3);
+  font-size: 0.9rem;
+}
+.wf-editor__placeholder--error { color: var(--accent-warn, #fbbf24); }
+
+.wf-editor__hint code {
+  background: var(--paper-3);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.78rem;
+}
+
+/* Floating settings popover: portal-rendered into <body> at the cursor's
+   click location. Positioned via inline `left` / `top` (computed by
+   `clampToViewport` in the component). Width is also inline (POPOVER_WIDTH)
+   so the JS clamp logic stays the single source of truth. */
+.wf-popover {
+  position: fixed;
+  z-index: 200;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  box-shadow: 0 12px 40px -8px rgba(0, 0, 0, 0.5), 0 4px 12px -4px rgba(0, 0, 0, 0.25);
+  max-height: min(70vh, 600px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.wf-popover__close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  background: transparent;
+  border: none;
+  color: var(--ink-3);
+  padding: 4px;
+  border-radius: var(--r-1, 4px);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.wf-popover__close:hover { color: var(--ink); background: var(--paper-3); }
+.wf-popover__close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.wf-popover__body {
+  padding: var(--s-4);
+  padding-top: var(--s-3);
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Variable picker. Floats beside the settings popover (typically to its
+   left so the canvas stays uncovered) when a text input in the panel is
+   focused. Lists predecessor steps' outputs in flow order; click or drag
+   a row to insert `{{step.field}}` at the input's cursor. */
+.wf-var-picker {
+  position: fixed;
+  width: 280px;
+  max-height: 70vh;
+  z-index: 205;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  box-shadow: 0 12px 40px -8px rgba(0, 0, 0, 0.5), 0 4px 12px -4px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.wf-var-picker__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--s-2) var(--s-3);
+  border-bottom: 1px solid var(--rule-soft);
+}
+.wf-var-picker__head h3 {
+  margin: 0;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+}
+.wf-var-picker__close {
+  background: transparent;
+  border: none;
+  color: var(--ink-3);
+  padding: 2px;
+  border-radius: var(--r-1, 4px);
+  cursor: pointer;
+  display: inline-flex;
+}
+.wf-var-picker__close:hover { color: var(--ink); background: var(--paper-3); }
+.wf-var-picker__empty {
+  padding: var(--s-3);
+  font-size: 0.78rem;
+  color: var(--ink-3);
+  line-height: 1.4;
+}
+.wf-var-picker__groups {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+.wf-var-picker__group {
+  border-bottom: 1px solid var(--rule-soft);
+}
+.wf-var-picker__group:last-child { border-bottom: none; }
+.wf-var-picker__group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px var(--s-3) 4px;
+  background: var(--paper-3);
+}
+.wf-var-picker__step {
+  font-size: 0.78rem;
+  color: var(--ink);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wf-var-picker__step-name {
+  font-size: 0.68rem;
+  color: var(--ink-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.wf-var-picker__rows {
+  list-style: none;
+  margin: 0;
+  padding: 2px 0;
+}
+.wf-var-picker__row {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 4px var(--s-3);
+  color: var(--ink);
+  font-size: 0.82rem;
+  cursor: grab;
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.wf-var-picker__row:hover,
+.wf-var-picker__row:focus-visible {
+  background: var(--paper-3);
+  outline: none;
+}
+.wf-var-picker__row:active { cursor: grabbing; }
+.wf-var-picker__label { display: inline-block; }
+.wf-var-picker__footer {
+  padding: 6px var(--s-3);
+  border-top: 1px solid var(--rule-soft);
+  font-size: 0.7rem;
+  color: var(--ink-3);
+  background: var(--paper-3);
+}
+.wf-var-picker__footer code {
+  background: var(--paper);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Chip-rendering text field. Used everywhere a piece input takes a
+   templated string -- the contentEditable hosts both plain text and
+   atomic `{{step.field}}` chips. Visually mimics the prior native
+   `<input>` chrome so the swap reads as "same field, smarter content". */
+.wf-chip-field {
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink);
+  padding: 6px 8px;
+  font-size: 0.82rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  min-height: 1.5em;
+  cursor: text;
+  width: 100%;
+  box-sizing: border-box;
+  /* Without explicit line-height, chip baselines wobble vertically when
+     adjacent text doesn't have descenders. */
+  line-height: 1.6;
+}
+.wf-chip-field:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+.wf-chip-field--singleline {
+  /* Keep the field one line tall and scroll horizontally for long
+     content; matches the visual model of an `<input type="text">`. */
+  white-space: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.wf-chip-field--multiline {
+  white-space: pre-wrap;
+  min-height: 3em;
+  overflow-y: auto;
+  resize: vertical;
+}
+/* Placeholder: render via data-attribute since `::placeholder` doesn't
+   apply to contentEditable. Disappears as soon as the field has any
+   child (text or chip). */
+.wf-chip-field:empty::before {
+  content: attr(data-placeholder);
+  color: var(--ink-3);
+  pointer-events: none;
+}
+
+/* Atomic variable chip. Pill-shaped accent-tinted token; the user reads
+   it as "this slot will be filled with whatever `email_status` resolves
+   to". Cursor stays text (not pointer) because the chip lives inside an
+   editable region and users may want to click around it. */
+.wf-chip {
+  display: inline-block;
+  padding: 1px 6px;
+  margin: 0 1px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  user-select: none;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+/* Canvas right-click menu. Small, terse, keyboard-navigable. Painted via
+   portal at the cursor's screen coordinates. */
+.wf-canvas-menu {
+  position: fixed;
+  z-index: 210;
+  min-width: 180px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  box-shadow: 0 10px 30px -6px rgba(0, 0, 0, 0.45), 0 3px 8px -2px rgba(0, 0, 0, 0.2);
+  padding: 4px;
+}
+.wf-canvas-menu__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.wf-canvas-menu__item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  border-radius: var(--r-1, 4px);
+  color: var(--ink);
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-align: left;
+}
+.wf-canvas-menu__item--active:not(.wf-canvas-menu__item--disabled),
+.wf-canvas-menu__item:hover:not(.wf-canvas-menu__item--disabled) {
+  background: var(--paper-3);
+}
+/* Destructive (Delete): tints the icon + label red on hover/active so the
+   user has a clear visual cue before they trigger the irreversible
+   action. Plain state stays neutral to avoid scaring the user at rest. */
+.wf-canvas-menu__item--destructive.wf-canvas-menu__item--active,
+.wf-canvas-menu__item--destructive:hover {
+  color: var(--accent);
+}
+/* Disabled (e.g. "Add error handling" placeholder): no hover, no fire on
+   click. Keeps the entry visible so users discover the feature is
+   coming, without letting them accidentally invoke a no-op. */
+.wf-canvas-menu__item--disabled {
+  color: var(--ink-3);
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.wf-canvas-menu__label { flex: 1 1 auto; }
+.wf-canvas-menu__shortcut {
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  padding: 1px 6px;
+  border: 1px solid var(--rule-soft);
+  border-radius: 4px;
+  background: var(--paper);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Piece library popover: searchable list of actions opened from the
+   canvas context menu's "Add piece" entry. */
+.wf-library {
+  position: fixed;
+  z-index: 210;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  box-shadow: 0 12px 40px -8px rgba(0, 0, 0, 0.5), 0 4px 12px -4px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.wf-library__search {
+  padding: var(--s-2);
+  border-bottom: 1px solid var(--rule-soft);
+  background: var(--paper-2);
+  position: sticky;
+  top: 0;
+}
+.wf-library__search input {
+  width: 100%;
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink);
+  padding: 6px 10px;
+  font-size: 0.88rem;
+  box-sizing: border-box;
+}
+.wf-library__search input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+.wf-library__list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+}
+.wf-library__row {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: var(--r-1, 4px);
+  padding: 6px 10px;
+  color: var(--ink);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.wf-library__row--active,
+.wf-library__row:hover {
+  background: var(--paper-3);
+}
+.wf-library__row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 0.85rem;
+}
+.wf-library__piece { color: var(--ink-2); }
+.wf-library__sep { color: var(--ink-3); }
+.wf-library__action { color: var(--ink); font-weight: 500; }
+.wf-library__row-desc {
+  font-size: 0.74rem;
+  color: var(--ink-3);
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.wf-library__empty {
+  padding: var(--s-4) var(--s-3);
+  color: var(--ink-3);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+/* Status banner pinned between the categories and the list. Used when
+   the catalog is empty so the user understands the popover isn't broken --
+   the daemon side is. Warn-tinted to read as "needs attention" without
+   being alarming. */
+.wf-library__notice {
+  margin: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--warn);
+  background: var(--paper-3);
+  border-radius: var(--r-2);
+  color: var(--ink-2);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+.wf-library__notice strong { color: var(--ink); }
+.wf-library__notice code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  background: var(--paper-2);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+/* Category tabs sit below the search input. Pill-style buttons so the
+   active one reads as a chip rather than a tab underline -- the latter
+   doesn't fit the editor's mostly-flat treatment. */
+.wf-library__categories {
+  display: flex;
+  gap: 4px;
+  padding: 0 var(--s-2) var(--s-2);
+  border-bottom: 1px solid var(--rule-soft);
+}
+.wf-library__category {
+  background: transparent;
+  border: 1px solid var(--rule-soft);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 0.75rem;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.wf-library__category:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+.wf-library__category--active {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+
+/* Category tag rendered on the left of a control-flow row. Reads as
+   "this isn't a piece" without crowding the row's text content. */
+.wf-library__tag {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+  line-height: 1.5;
+}
+/* "Install" variant for uninstalled-piece rows. Painted in the accent
+   color so users notice picking the row will trigger a download rather
+   than drop an immediate node. */
+.wf-library__tag--install {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+/* In-flight install variant -- spinner replaces the "Install" text. The
+   row stays at full opacity so the user can see what's installing while
+   the rest of the list dims via wf-library__row--locked. */
+.wf-library__tag--installing {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  min-height: 16px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.wf-library__spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid color-mix(in srgb, var(--accent) 25%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: wf-library-spin 0.8s linear infinite;
+}
+@keyframes wf-library-spin {
+  to { transform: rotate(360deg); }
+}
+/* Row state: the piece we're currently installing. Stays interactive-
+   looking (the row itself is disabled at the React level; this is the
+   visual cue). */
+.wf-library__row--installing {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  cursor: progress;
+}
+/* Row state: everything else while an install is in flight. Faded so
+   the user knows the list is paused; the React `disabled` attribute
+   blocks the click. */
+.wf-library__row--locked {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: auto; /* keep hover targeting -- only clicks are blocked */
+}
+.wf-library__row--locked:hover {
+  background: transparent; /* suppress the active-row highlight */
+}
+/* Small secondary chip showing tier=community on uninstalled rows. Stays
+   subtle -- verified pieces don't render this at all. */
+.wf-library__tier {
+  font-size: 0.65rem;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-pill);
+  padding: 0 6px;
+  line-height: 1.4;
+  margin-left: auto;
+}
+
+/* ── React Flow surface tweaks ── */
+
+.wf-editor__canvas .react-flow__renderer { background: var(--paper); }
+.wf-editor__canvas .react-flow__background { color: var(--rule-soft); }
+/* Main chain edges: solid grey 1.5px. Branch / loop-body edges keep the
+   same colour for visual coherence but render with a dashed pattern so the
+   user can tell sequential vs. sub-chain connections at a glance. */
+.wf-editor__canvas .react-flow__edge-path {
+  stroke: var(--wf-edge-stroke);
+  stroke-width: 1.5px;
+  fill: none;
+}
+.wf-editor__canvas .react-flow__edge.wf-edge--branch .react-flow__edge-path {
+  stroke-dasharray: 4 3;
+}
+.wf-editor__canvas .react-flow__edge.selected .react-flow__edge-path,
+.wf-editor__canvas .react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--wf-edge-stroke-selected);
+  stroke-width: 2px;
+}
+.wf-editor__canvas .react-flow__edge-text { font-size: 0.72rem; fill: var(--ink-3); }
+.wf-editor__canvas .react-flow__edge-textbg { fill: var(--paper); }
+.wf-editor__canvas .react-flow__controls {
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+}
+.wf-editor__canvas .react-flow__controls-button {
+  background: transparent;
+  border-bottom: 1px solid var(--rule-soft);
+  color: var(--ink-2);
+}
+
+/* ── Connection handles ──
+   xyflow renders each <Handle/> as a small .react-flow__handle div. The
+   outer div is the HIT TARGET -- generous (`--wf-handle-size`) so the
+   user doesn't have to aim at a pixel-perfect dot. The ::after is the
+   VISIBLE chrome (`--wf-handle-dot`) -- smaller, centred inside the
+   hit area, so the affordance reads as a small circle without sacrificing
+   click slack. */
+.wf-editor__canvas .react-flow__handle.wf-handle {
+  width: var(--wf-handle-size);
+  height: var(--wf-handle-size);
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  /* Sit centred on the node edge regardless of size. */
+  min-width: var(--wf-handle-size);
+  min-height: var(--wf-handle-size);
+}
+.wf-editor__canvas .react-flow__handle.wf-handle::after {
+  content: "";
+  position: absolute;
+  /* Centre the visible dot inside the hit area. */
+  top: 50%;
+  left: 50%;
+  width: var(--wf-handle-dot);
+  height: var(--wf-handle-dot);
+  margin-top: calc(var(--wf-handle-dot) / -2);
+  margin-left: calc(var(--wf-handle-dot) / -2);
+  background: var(--wf-handle-bg);
+  border: 1.5px solid var(--wf-handle-border);
+  border-radius: 999px;
+  transition: border-color 120ms ease, transform 120ms ease, background 120ms ease;
+}
+.wf-editor__canvas .react-flow__handle.wf-handle:hover::after,
+.wf-editor__canvas .react-flow__handle.wf-handle.connectingfrom::after,
+.wf-editor__canvas .react-flow__handle.wf-handle.connectingto::after {
+  border-color: var(--wf-handle-border-hover);
+  background: var(--wf-handle-border-hover);
+  transform: scale(1.4);
+}
+/* Right-edge source handles are vertically spread via inline `top` set
+   from `StepNode`. When there are multiple (LOOP body + after-loop;
+   ROUTER one-per-branch), each one ends up at `top: (i+1)/(n+1) * 100%`
+   so they're evenly distributed along the right edge regardless of card
+   height. No bottom-edge handles anymore. */
+/* "Used" handle: already wired to a successor. We dim the circle and disable
+   the pointer cursor so the user understands they have to right-click the
+   existing edge first to free the handle before dragging a new one. */
+.wf-editor__canvas .react-flow__handle.wf-handle--used::after {
+  background: var(--wf-handle-border);
+  opacity: 0.55;
+}
+.wf-editor__canvas .react-flow__handle.wf-handle--used {
+  cursor: not-allowed;
+}
+
+/* ── Custom node ── */
+
+.wf-node {
+  min-width: 220px;
+  max-width: 260px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  padding: var(--s-2) var(--s-3);
+  font-size: 0.85rem;
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+.wf-node:hover { border-color: var(--ink-3); }
+.wf-node--selected { border-color: var(--accent); }
+.wf-node--unconfigured { border-color: var(--accent-warn, #fbbf24); }
+.wf-node--nested {
+  background: var(--paper-3);
+  border-style: dashed;
+}
+/* Orphan: created by right-click disconnect (until re-wired) or by the
+   library picker before the user connects it. Renders with a dashed warn-
+   tinted border so it's obviously "not yet part of the flow". */
+.wf-node--orphan {
+  border-style: dashed;
+  border-color: var(--accent-warn, #fbbf24);
+  opacity: 0.92;
+}
+
+.wf-node__branch-label {
+  position: absolute;
+  top: -18px;
+  left: 6px;
+  font-size: 0.68rem;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: var(--paper);
+  padding: 1px 6px;
+  border: 1px solid var(--rule-soft);
+  border-radius: 999px;
+  z-index: 1;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.wf-node { position: relative; }
+
+/* ── Router branch list (panel) ── */
+
+.wf-props__branch-list {
+  list-style: none;
+  margin: 0 0 var(--s-2);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* Branch row carries two children: a head (name + actions) and an
+   optional inline condition editor below it. Column layout so the
+   editor can wrap and grow without pushing the actions sideways. */
+.wf-props__branch-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: 6px;
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+}
+.wf-props__branch-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+}
+.wf-props__branch-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  color: var(--ink);
+}
+.wf-props__branch-tag {
+  background: var(--paper);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  padding: 1px 5px;
+  border-radius: 999px;
+  border: 1px solid var(--rule-soft);
+}
+.wf-props__branch-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Inline condition editor stacked beneath a CONDITION branch. Each row
+   is [firstValue] [operator] [secondValue?] [trash] [case sensitive?]. */
+.wf-props__conditions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding-top: var(--s-2);
+  border-top: 1px dashed var(--rule-soft);
+}
+.wf-props__condition-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.wf-props__condition-row {
+  display: grid;
+  /* firstValue and secondValue flex; operator + trash sit at fixed widths */
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px;
+}
+.wf-props__condition-and {
+  grid-column: 1 / -1;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+}
+.wf-props__condition-field {
+  width: 100%;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink);
+  padding: 4px 6px;
+  font-size: 0.8rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  box-sizing: border-box;
+}
+.wf-props__condition-op {
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink);
+  padding: 4px 6px;
+  font-size: 0.8rem;
+}
+.wf-props__condition-case {
+  grid-column: 1 / -1;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72rem;
+  color: var(--ink-3);
+}
+.wf-props__condition-case input { width: 12px; height: 12px; margin: 0; }
+.wf-props__hint--inline {
+  margin: 0;
+  font-size: 0.74rem;
+}
+
+.wf-node__head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-bottom: 4px;
+}
+.wf-node__name {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wf-node__body {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wf-node__sep { color: var(--ink-3); }
+.wf-node__action { color: var(--ink); }
+.wf-node__piece--missing { color: var(--accent-warn, #fbbf24); font-style: italic; }
+
+/* ── Properties panel ── */
+
+.wf-props__header h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--ink);
+}
+
+/* Click-to-edit step title in the properties panel header. Mirrors
+   the workflow-title pattern from the editor chrome: hover tint as the
+   affordance, swap to an inset input on click. */
+.wf-props__title {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--ink);
+  cursor: text;
+  padding: 1px 6px;
+  margin-left: -6px;
+  border-radius: var(--r-2);
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wf-props__title:hover {
+  background: var(--paper-3);
+}
+.wf-props__title:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.wf-props__title-input {
+  margin: 0;
+  margin-left: -6px;
+  font-size: 0.95rem;
+  font-family: inherit;
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--paper-3);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-2);
+  padding: 1px 6px;
+  outline: none;
+  min-width: 120px;
+  max-width: 100%;
+  width: 100%;
+  box-sizing: border-box;
+}
+.wf-props__header p {
+  margin: 2px 0 var(--s-3);
+  font-size: 0.75rem;
+  color: var(--ink-3);
+}
+.wf-props__header code {
+  background: var(--paper-3);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.wf-props__divider {
+  height: 1px;
+  background: var(--rule-soft);
+  margin: var(--s-3) 0;
+}
+
+
+.wf-props__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: var(--s-3);
+}
+.wf-props__field-label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+}
+.wf-props__field select {
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink);
+  padding: 6px 8px;
+  font-size: 0.85rem;
+}
+
+.wf-props__inputs h4 {
+  margin: 0 0 var(--s-2);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+}
+
+.wf-props__hint {
+  margin: var(--s-1) 0;
+  color: var(--ink-3);
+  font-size: 0.8rem;
+}
+
+.wf-props__input-list {
+  list-style: none;
+  margin: 0 0 var(--s-2);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+
+.wf-props__input-row {
+  display: flex;
+  gap: 4px;
+  align-items: flex-start;
+}
+.wf-props__input-row label {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.wf-props__input-key {
+  font-size: 0.75rem;
+  color: var(--ink-3);
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.wf-props__input-row textarea {
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink);
+  padding: 6px 8px;
+  font-size: 0.82rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  resize: vertical;
+}
+
+.wf-props__input-remove {
+  background: transparent;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink-3);
+  padding: 4px;
+  cursor: pointer;
+  margin-top: 18px;
+}
+.wf-props__input-remove:hover { color: var(--accent-warn, #fbbf24); border-color: var(--accent-warn, #fbbf24); }
+
+.wf-props__add-row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  border-top: 1px dashed var(--rule-soft);
+  padding-top: var(--s-2);
+}
+.wf-props__add-row input,
+.wf-props__field input[type="text"] {
+  flex: 1;
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink);
+  padding: 6px 8px;
+  font-size: 0.82rem;
+}
+
+.wf-props__field input[type="text"] { width: 100%; box-sizing: border-box; }
+
+.wf-props__segmented {
+  display: flex;
+  gap: 4px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  padding: 3px;
+}
+.wf-props__seg {
+  flex: 1;
+  background: transparent;
+  border: none;
+  border-radius: calc(var(--r-2) - 2px);
+  color: var(--ink-2);
+  font-size: 0.78rem;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.wf-props__seg:hover { color: var(--ink); }
+.wf-props__seg--on {
+  background: var(--paper-3);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.wf-props__step-actions {
+  display: flex;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+
+/* ── Schema-aware fields ── */
+
+.wf-props__schema-row {
+  list-style: none;
+}
+
+.wf-props__field--inline {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: var(--s-2);
+}
+.wf-props__field--inline input[type="checkbox"] {
+  margin: 0;
+  width: 14px;
+  height: 14px;
+}
+
+.wf-props__field--missing input,
+.wf-props__field--missing textarea,
+.wf-props__field--missing select {
+  border-color: var(--accent-warn, #fbbf24);
+}
+.wf-props__field-label--missing { color: var(--accent-warn, #fbbf24); }
+
+.wf-props__req {
+  color: var(--accent-warn, #fbbf24);
+  font-weight: 500;
+}
+
+.wf-props__field-help {
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+.wf-props__field-help--error { color: var(--accent-warn, #fbbf24); }
+
+/* Inline "?" glyph that lives next to a field label (used on boolean
+   fields today). Hover shows the description via the native title
+   tooltip; the glyph itself is a small rounded badge in muted tone. */
+.wf-props__field-helper {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-left: 4px;
+  border: 1px solid var(--rule-soft);
+  border-radius: 50%;
+  font-family: var(--font-sans);
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: var(--ink-3);
+  background: var(--paper-2);
+  cursor: help;
+  user-select: none;
+  line-height: 1;
+}
+.wf-props__field-helper:hover {
+  background: var(--paper-3);
+  color: var(--ink);
+}
+.wf-props__field-helper:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.wf-props__field input[type="number"],
+.wf-props__field textarea {
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink);
+  padding: 6px 8px;
+  font-size: 0.82rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.wf-props__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.wf-props__chip {
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 0.78rem;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+.wf-props__chip:hover { color: var(--ink); }
+.wf-props__chip--on {
+  background: var(--paper-3);
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+/* Error-handling section inside the settings popover for PIECE/CODE
+   steps. Two checkboxes (continueOnFailure, retryOnFailure) and their
+   help text -- same field layout as the rest of the panel. */
+.wf-props__error-handling {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.wf-props__error-handling h4 {
+  margin: 0 0 var(--s-2);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+}
+.wf-props__error-handling .wf-props__field {
+  margin-bottom: 0;
+}
+.wf-props__error-handling .wf-props__hint {
+  margin: 0 0 var(--s-2) 22px;
+}
+
+/* Connection picker. Shown for pieces with top-level `auth`. The
+   chosen connection is stored as `{{connections.<externalId>}}` in
+   `settings.input.auth`; the engine resolves it at runtime. */
+.wf-props__connection {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: var(--s-3);
+  padding-bottom: var(--s-3);
+  border-bottom: 1px dashed var(--rule-soft);
+}
+.wf-props__connection select {
+  font-family: inherit;
+  font-size: 0.85rem;
+  padding: 4px 6px;
+  background: var(--paper-2);
+  color: var(--ink);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+}
+.wf-props__connection-type {
+  margin-left: 6px;
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  text-transform: lowercase;
+}
+.wf-props__connection-empty {
+  font-style: italic;
+  color: var(--accent-warn, #fbbf24);
+}
+
+/* Collapsible "Advanced settings" block. Wraps error handling, sample
+   input/output editors, and the test button so the main properties
+   panel stays focused on the step's regular inputs. */
+.wf-props__advanced {
+  margin-top: var(--s-3);
+  border-top: 1px solid var(--rule-soft);
+  padding-top: var(--s-3);
+}
+.wf-props__advanced-toggle {
+  background: transparent;
+  border: 0;
+  padding: 4px 6px;
+  margin-left: -6px;
+  color: var(--ink-2);
+  font-family: inherit;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--r-2);
+}
+.wf-props__advanced-toggle:hover {
+  color: var(--ink);
+  background: var(--paper-3);
+}
+.wf-props__advanced-toggle--open {
+  color: var(--ink);
+}
+.wf-props__advanced-caret {
+  font-size: 0.7rem;
+  display: inline-block;
+  width: 10px;
+}
+.wf-props__advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  margin-top: var(--s-2);
+}
+
+/* Per-step sample data editor + Test this step button, rendered inside
+   the Advanced collapsible. */
+.wf-props__sample-data {
+  margin-top: var(--s-3);
+  padding-top: var(--s-3);
+  border-top: 1px dashed var(--rule-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+.wf-props__sample-header { display: flex; flex-direction: column; gap: 2px; }
+.wf-props__sample-title {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.wf-props__sample-textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  padding: var(--s-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  background: var(--surface-1);
+  color: var(--ink);
+  resize: vertical;
+}
+.wf-props__sample-textarea:disabled { opacity: 0.6; cursor: not-allowed; }
+.wf-props__sample-err { color: var(--accent); font-size: 0.72rem; }
+.wf-props__sample-status { font-size: 0.78rem; }
+.wf-props__sample-status--ok { color: var(--accent-ok, #5eead4); }
+.wf-props__sample-status--warn { color: var(--accent-warn, #fbbf24); }
+.wf-props__sample-actions { display: flex; gap: var(--s-1); flex-wrap: wrap; }
+
+/* --- flow_ref widget (workflow picker) ------------------------------ */
+.wf-flow-ref { display: flex; flex-direction: column; gap: var(--s-1); }
+.wf-flow-ref__trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: var(--s-1) var(--s-2);
+  background: var(--paper-1);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-1);
+  color: var(--ink);
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+}
+.wf-flow-ref__trigger:hover { border-color: var(--rule); }
+.wf-flow-ref__trigger-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-flow-ref__trigger-caret { color: var(--ink-3); font-size: 0.7rem; }
+.wf-flow-ref__popover {
+  position: fixed;
+  z-index: 220;
+  max-height: 320px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  box-shadow: 0 12px 40px -8px rgba(0, 0, 0, 0.5), 0 4px 12px -4px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.wf-flow-ref__search {
+  width: 100%;
+  padding: var(--s-2) var(--s-3);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--rule-soft);
+  color: var(--ink);
+  font-size: 0.85rem;
+  outline: none;
+}
+.wf-flow-ref__search::placeholder { color: var(--ink-3); }
+.wf-flow-ref__list {
+  list-style: none;
+  margin: 0;
+  padding: var(--s-1) 0;
+  overflow-y: auto;
+  flex: 1;
+}
+.wf-flow-ref__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-1) var(--s-3);
+  background: transparent;
+  border: none;
+  color: var(--ink);
+  font-size: 0.82rem;
+  text-align: left;
+  cursor: pointer;
+}
+.wf-flow-ref__row:hover { background: var(--paper-1); }
+.wf-flow-ref__row--active { background: var(--paper-1); }
+.wf-flow-ref__row--on { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.wf-flow-ref__row--on.wf-flow-ref__row--active { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+.wf-flow-ref__row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.wf-flow-ref__row-id { color: var(--ink-3); font-size: 0.7rem; font-family: var(--font-mono, monospace); }
+.wf-flow-ref__hint {
+  margin: 0;
+  padding: var(--s-2) var(--s-3);
+  color: var(--ink-3);
+  font-size: 0.78rem;
+}
+.wf-flow-ref__hint--error { color: var(--accent); }
+.wf-flow-ref__clear {
+  padding: var(--s-1) var(--s-3);
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--rule-soft);
+  color: var(--ink-3);
+  font-size: 0.78rem;
+  text-align: left;
+  cursor: pointer;
+}
+.wf-flow-ref__clear:hover { color: var(--accent); }

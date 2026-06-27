@@ -1,0 +1,119 @@
+.v2-paused {
+  background: var(--paper);
+  border-bottom: var(--hair);
+  border-left: 3px solid var(--warn);
+  font-size: var(--text-sm);
+  color: var(--ink);
+}
+
+.v2-paused__head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-2) var(--s-6);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  color: inherit;
+  text-align: left;
+  font: inherit;
+}
+
+.v2-paused__head:hover {
+  background: var(--paper-2);
+}
+
+.v2-paused__head-icon {
+  color: var(--warn);
+  display: inline-flex;
+  align-items: center;
+}
+
+.v2-paused__headline {
+  font-weight: 600;
+}
+
+.v2-paused__sub {
+  color: var(--ink-3);
+  font-size: var(--text-xs);
+  flex: 1;
+}
+
+.v2-paused__list {
+  list-style: none;
+  margin: 0;
+  padding: 0 var(--s-6) var(--s-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.v2-paused__item {
+  padding: var(--s-2) var(--s-3);
+  background: var(--paper-2);
+  border: var(--hair);
+  border-radius: var(--r-1);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-3);
+}
+
+.v2-paused__item-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.v2-paused__q {
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+
+.v2-paused__meta {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  color: var(--ink-3);
+  font-size: var(--text-xs);
+}
+
+.v2-paused__tag {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: var(--r-1);
+  background: var(--paper-3);
+  color: var(--ink-3);
+}
+
+.v2-paused__intent {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+
+.v2-paused__reply {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  padding: 4px 10px;
+  font: inherit;
+  font-size: var(--text-xs);
+  color: var(--ink);
+  background: var(--paper);
+  border: var(--hair);
+  border-radius: var(--r-1);
+  cursor: pointer;
+}
+
+.v2-paused__reply:hover {
+  background: var(--paper-3);
+  border-color: var(--ink-3);
+}

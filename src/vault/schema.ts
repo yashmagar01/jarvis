@@ -362,6 +362,11 @@ function createTables(db: Database): void {
   db.run(`CREATE INDEX IF NOT EXISTS idx_approval_agent ON approval_requests(agent_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_approval_category ON approval_requests(action_category)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_approval_created ON approval_requests(created_at)`);
+  // Migration: 'inline' requests are executed by the authority gate that is
+  // blocked waiting on them (result flows back to the conversation); the
+  // approve endpoints only flip the status. 'deferred' keeps the legacy
+  // execute-on-approve behavior.
+  try { db.run(`ALTER TABLE approval_requests ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'deferred'`); } catch {}
 
   // Authority: Audit trail
   db.run(`
@@ -383,6 +388,10 @@ function createTables(db: Database): void {
   db.run(`CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_trail(agent_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_audit_category ON audit_trail(action_category)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_trail(created_at)`);
+  // Migration: tag the resolution channel ('click' | 'voice' | 'system' | null).
+  // Useful forensics if a voice misfire ever resolves something it shouldn't.
+  // Column is nullable so existing rows remain valid; new rows specify it.
+  try { db.run(`ALTER TABLE audit_trail ADD COLUMN channel TEXT`); } catch {}
 
   // Authority: Approval patterns (for learning)
   db.run(`
@@ -404,8 +413,8 @@ function createTables(db: Database): void {
       id TEXT PRIMARY KEY,
       timestamp INTEGER NOT NULL,
       session_id TEXT,
+      sidecar_id TEXT,
       image_path TEXT,
-      thumbnail_path TEXT,
       pixel_change_pct REAL,
       ocr_text TEXT,
       app_name TEXT,
@@ -417,10 +426,23 @@ function createTables(db: Database): void {
       created_at INTEGER NOT NULL
     )
   `);
+  // OCR moved to sidecar; thumbnails are no longer generated.
+  try { db.run('ALTER TABLE screen_captures DROP COLUMN thumbnail_path'); } catch { /* already dropped or never present */ }
+  // Track which sidecar owns the capture file so the brain can route
+  // fetch_capture RPCs correctly (sidecars may run on different hosts).
+  try { db.run('ALTER TABLE screen_captures ADD COLUMN sidecar_id TEXT'); } catch { /* already present */ }
   db.run(`CREATE INDEX IF NOT EXISTS idx_captures_timestamp ON screen_captures(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_captures_session ON screen_captures(session_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_captures_retention ON screen_captures(retention_tier)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_captures_app ON screen_captures(app_name)`);
+
+  // Migration: thumbnail_path was added to the schema after the table was
+  // created on existing installs. CREATE TABLE IF NOT EXISTS is a no-op
+  // when the table exists, so older databases miss the column and every
+  // capture insert fails with "no column named thumbnail_path". ALTER
+  // adds it; the try/catch silently swallows the "duplicate column" error
+  // on subsequent runs.
+  try { db.run('ALTER TABLE screen_captures ADD COLUMN thumbnail_path TEXT'); } catch { /* already present */ }
 
   db.run(`
     CREATE TABLE IF NOT EXISTS awareness_sessions (
@@ -646,6 +668,9 @@ function createTables(db: Database): void {
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_sidecars_name ON sidecars(name)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_sidecars_token_id ON sidecars(token_id)`);
+  // Sidecar's own (brain-decoupled) version, reported on register. Added later;
+  // ALTER in try/catch is the migration pattern used throughout this file.
+  try { db.run('ALTER TABLE sidecars ADD COLUMN version TEXT'); } catch { /* already present */ }
 
   // Settings table: key-value store for dashboard-managed configuration
   db.run(`
@@ -696,4 +721,91 @@ function createTables(db: Database): void {
   if (!webappCols.some((c) => c.name === 'keywords')) {
     db.run(`ALTER TABLE webapp_templates ADD COLUMN keywords TEXT NOT NULL DEFAULT '[]'`);
   }
+
+  // Recent objects: cross-device LRU of palette picks. The dashboard primarily
+  // reads `picked_at` desc and dedupes on (object_type, object_id) so the same
+  // pick repeated bumps the timestamp instead of accumulating rows.
+  // Capped externally — the API trims to 50 most-recent on insert.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS recent_objects (
+      id TEXT PRIMARY KEY,
+      object_type TEXT NOT NULL,
+      object_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT,
+      meta TEXT,
+      picked_at INTEGER NOT NULL,
+      UNIQUE(object_type, object_id)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_recent_objects_picked ON recent_objects(picked_at DESC)`);
+
+  // Agent activity history (Phase 6.3 — Agents Room).
+  // Persisted snapshot of `subAgentEvents` so the dashboard can show a
+  // per-agent activity timeline that survives reload. Today these events
+  // only stream over WS — empty state on first paint after a refresh
+  // wasn't acceptable for a "what's this agent doing" Room.
+  // Bounded growth: trimmed externally on insert (most recent 1000 per
+  // agent kept). `data` is JSON-stringified payload.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS agent_activity (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      agent_name TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK(event_type IN ('text', 'tool_call', 'done')),
+      data TEXT,
+      task_id TEXT,
+      timestamp INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_agent_activity_agent_id ON agent_activity(agent_id, timestamp DESC)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_agent_activity_timestamp ON agent_activity(timestamp DESC)`);
+
+  // LLM usage tracking: every chatTier/streamTier call appends one row so
+  // future cost analysis can attribute consumption to a subsystem (chat,
+  // heartbeat, voice_intent, extractor, suggestion_engine, ...) on a given
+  // tier and model. No caps or enforcement at this layer.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS llm_usage (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      tier TEXT NOT NULL,
+      resolved_tier TEXT NOT NULL,
+      subsystem TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      latency_ms INTEGER NOT NULL DEFAULT 0,
+      error_code TEXT
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts DESC)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_llm_usage_subsystem ON llm_usage(subsystem, ts DESC)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_llm_usage_tier ON llm_usage(tier, ts DESC)`);
+
+  // Conv-tier delegated tasks. The TaskRegistry mirrors mutations here so
+  // paused (needs_input) tasks survive daemon restarts: the user's eventual
+  // clarification reply can still resume the saved conversation buffer. Tasks
+  // that were mid-flight (running/queued) at shutdown are reconciled to
+  // failed on boot because the LLM call doesn't survive a process restart.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      tier TEXT NOT NULL,
+      template TEXT NOT NULL,
+      intent TEXT NOT NULL,
+      original_message TEXT,
+      subsystem TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      result_json TEXT,
+      question TEXT,
+      paused_conversation TEXT
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at DESC)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_at DESC)`);
 }

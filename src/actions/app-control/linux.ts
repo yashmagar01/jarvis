@@ -51,18 +51,11 @@ export class LinuxAppController implements AppController {
     }
   }
 
-  async getWindowTree(pid: number): Promise<UIElement[]> {
-    // TODO: Implement using AT-SPI2 (Assistive Technology Service Provider Interface)
-    // This requires complex bindings to the AT-SPI D-Bus interface
-    // For now, return empty array with informative error
-    console.warn(
-      `getWindowTree not yet implemented for Linux.\n` +
-      `Requires AT-SPI2 integration via D-Bus. Consider using:\n` +
-      `  - python-atspi library\n` +
-      `  - Accerciser tool for exploration\n` +
-      `  - Direct D-Bus bindings`
+  async getWindowTree(_pid: number): Promise<UIElement[]> {
+    throw new Error(
+      'UI element traversal is not implemented on Linux yet (requires AT-SPI2). ' +
+      'Use desktop_list_windows for window-level info, or pass a "target" sidecar that supports the desktop capability.',
     );
-    return [];
   }
 
   async listWindows(): Promise<WindowInfo[]> {
@@ -123,10 +116,29 @@ export class LinuxAppController implements AppController {
     await this.ensureTool('xdotool');
 
     try {
+      const action = typeof element.properties.action === 'string' ? element.properties.action : 'click';
+      const pid = typeof element.properties.pid === 'number' ? element.properties.pid : null;
+
+      if (action === 'focus') {
+        if (pid === null) {
+          throw new Error('Element is missing a PID, cannot focus window');
+        }
+        await this.focusWindow(pid);
+        return;
+      }
+
       const centerX = element.bounds.x + element.bounds.width / 2;
       const centerY = element.bounds.y + element.bounds.height / 2;
 
       await $`xdotool mousemove ${Math.round(centerX)} ${Math.round(centerY)}`;
+      if (action === 'double_click') {
+        await $`xdotool click --repeat 2 1`;
+        return;
+      }
+      if (action === 'right_click') {
+        await $`xdotool click 3`;
+        return;
+      }
       await $`xdotool click 1`;
     } catch (error) {
       throw new Error(`Failed to click element: ${error instanceof Error ? error.message : String(error)}`);
@@ -221,6 +233,31 @@ export class LinuxAppController implements AppController {
     }
   }
 
+  async launchApp(executable: string, args?: string): Promise<object> {
+    if (!executable.trim()) {
+      throw new Error('Executable is required');
+    }
+
+    try {
+      const proc = Bun.spawn(
+        [executable, ...this.parseCommandArgs(args)],
+        {
+          stdin: 'ignore',
+          stdout: 'ignore',
+          stderr: 'ignore',
+        },
+      );
+
+      return {
+        pid: proc.pid,
+        executable,
+        args: args ?? '',
+      };
+    } catch (error) {
+      throw new Error(`Failed to launch app: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   private async findWindowByPid(pid: number): Promise<string> {
     const windowIds = (await $`xdotool search --name "."`.text())
       .split('\n')
@@ -240,6 +277,15 @@ export class LinuxAppController implements AppController {
     }
 
     throw new Error(`No window found for PID ${pid}`);
+  }
+
+  private parseCommandArgs(args?: string): string[] {
+    if (!args?.trim()) {
+      return [];
+    }
+
+    const parts = args.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+    return parts.map((part) => part.replace(/^['"]|['"]$/g, ''));
   }
 
   private extractXpropValue(output: string, property: string): string | null {

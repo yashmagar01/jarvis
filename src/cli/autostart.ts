@@ -8,7 +8,6 @@
 
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { c, printOk, printErr, printWarn } from './helpers.ts';
@@ -56,28 +55,52 @@ function getJarvisPath(): string {
   return join(import.meta.dir, '../../bin/jarvis.ts');
 }
 
-function canUseSystemdUserService(): boolean {
+export type SpawnResultLike = {
+  exitCode: number;
+  stdout?: Uint8Array | ArrayBuffer | null;
+  stderr?: Uint8Array | ArrayBuffer | null;
+};
+
+export type SpawnSyncFn = (cmd: string[], opts?: { stdout?: 'ignore'; stderr?: 'ignore' }) => SpawnResultLike;
+
+const defaultSpawnSync: SpawnSyncFn = (cmd, opts) => Bun.spawnSync(cmd, opts as never) as unknown as SpawnResultLike;
+
+export type SystemdProbeResult = { supported: boolean; reason?: string };
+
+function firstNonEmpty(...outputs: (Uint8Array | ArrayBuffer | null | undefined)[]): string {
+  for (const o of outputs) {
+    const text = decodeLaunchctlOutput(o).trim();
+    if (text) return text.split('\n')[0]!.slice(0, 200);
+  }
+  return '';
+}
+
+export function probeSystemdUserService(spawnSync: SpawnSyncFn = defaultSpawnSync): SystemdProbeResult {
   try {
-    const version = Bun.spawnSync(['systemctl', '--user', '--version']);
-    if (version.exitCode !== 0) return false;
+    const version = spawnSync(['systemctl', '--user', '--version']);
+    if (version.exitCode !== 0) {
+      return { supported: false, reason: firstNonEmpty(version.stderr, version.stdout) || 'systemctl --user not available' };
+    }
 
-    const state = Bun.spawnSync(['systemctl', '--user', 'is-system-running'], {
-      stdout: 'ignore',
-      stderr: 'ignore',
-    });
-
+    const state = spawnSync(['systemctl', '--user', 'is-system-running']);
     // "running" exits 0, degraded/offline can still manage units and usually exits non-zero.
     // We only need the user manager to be reachable, not fully healthy.
-    if (state.exitCode === 0) return true;
+    if (state.exitCode === 0) return { supported: true };
 
-    const env = Bun.spawnSync(['systemctl', '--user', 'show-environment'], {
-      stdout: 'ignore',
-      stderr: 'ignore',
-    });
-    return env.exitCode === 0;
-  } catch {
-    return false;
+    const env = spawnSync(['systemctl', '--user', 'show-environment']);
+    if (env.exitCode === 0) return { supported: true };
+
+    return {
+      supported: false,
+      reason: firstNonEmpty(env.stderr, env.stdout, state.stderr, state.stdout) || 'user systemd manager unreachable',
+    };
+  } catch (err) {
+    return { supported: false, reason: err instanceof Error ? err.message : String(err) };
   }
+}
+
+export function canUseSystemdUserService(spawnSync: SpawnSyncFn = defaultSpawnSync): boolean {
+  return probeSystemdUserService(spawnSync).supported;
 }
 
 // ── systemd (Linux) ──────────────────────────────────────────────────
@@ -157,11 +180,15 @@ async function startSystemdService(): Promise<boolean> {
   }
 }
 
-function scheduleSystemdRestart(): boolean {
-  return spawnDetachedShell(
-    'sleep 1; systemctl --user restart jarvis.service >/dev/null 2>&1',
-    ['bash', 'systemctl'],
-  );
+export function scheduleSystemdRestart(spawnSync: SpawnSyncFn = defaultSpawnSync): boolean {
+  // --no-block returns immediately; systemd queues the restart through its own
+  // lifecycle, so the calling HTTP handler can return before the unit cycles.
+  try {
+    const res = spawnSync(['systemctl', '--user', '--no-block', 'restart', 'jarvis.service']);
+    return res.exitCode === 0;
+  } catch {
+    return false;
+  }
 }
 
 async function uninstallSystemd(): Promise<boolean> {
@@ -252,24 +279,21 @@ async function installLaunchd(): Promise<boolean> {
   }
 }
 
-function decodeLaunchctlOutput(output: Uint8Array | ArrayBuffer | null | undefined): string {
+const utf8Decoder = new TextDecoder('utf-8');
+
+export function decodeLaunchctlOutput(output: Uint8Array | ArrayBuffer | null | undefined): string {
   if (!output) {
     return '';
   }
 
   try {
-    if (output instanceof Uint8Array) {
-      return Buffer.from(output).toString('utf8');
-    }
-    return Buffer.from(new Uint8Array(output)).toString('utf8');
+    return utf8Decoder.decode(output);
   } catch {
     return '';
   }
 }
 
-function isLaunchdAlreadyLoaded(
-  result: { exitCode: number; stdout?: Uint8Array | ArrayBuffer | null; stderr?: Uint8Array | ArrayBuffer | null },
-): boolean {
+export function isLaunchdAlreadyLoaded(result: SpawnResultLike): boolean {
   if (result.exitCode === 0) {
     return false;
   }
@@ -283,24 +307,37 @@ function isLaunchdAlreadyLoaded(
   );
 }
 
+function launchctlReason(result: SpawnResultLike): string {
+  const combined = `${decodeLaunchctlOutput(result.stderr)}\n${decodeLaunchctlOutput(result.stdout)}`.trim();
+  const first = combined.split('\n').find((line) => line.trim().length > 0);
+  return (first ?? `exit ${result.exitCode}`).slice(0, 200);
+}
+
 async function startLaunchdService(): Promise<boolean> {
   try {
     const getuid = process.getuid;
     const uid = typeof getuid === 'function' ? getuid.call(process) : undefined;
 
+    let bootstrapReason: string | null = null;
     if (typeof uid === 'number') {
       const bootstrap = Bun.spawnSync(['launchctl', 'bootstrap', `gui/${uid}`, LAUNCHD_PLIST]);
       if (bootstrap.exitCode === 0 || isLaunchdAlreadyLoaded(bootstrap)) {
         printOk('JARVIS launch agent is running.');
         return true;
       }
+      bootstrapReason = launchctlReason(bootstrap);
     } else {
-      printWarn('Could not determine the current user UID; skipping launchctl bootstrap and falling back to launchctl load.');
+      bootstrapReason = 'could not determine current user UID';
+      printWarn('Skipping launchctl bootstrap — no UID; falling back to launchctl load.');
     }
 
     const load = Bun.spawnSync(['launchctl', 'load', LAUNCHD_PLIST]);
     if (load.exitCode !== 0 && !isLaunchdAlreadyLoaded(load)) {
-      printWarn('Installed launchd plist, but could not start it immediately. It should start on next login.');
+      const loadReason = launchctlReason(load);
+      printWarn(
+        `Installed launchd plist, but could not start it immediately. It should start on next login. ` +
+          `(bootstrap: ${bootstrapReason}; load: ${loadReason})`,
+      );
       return false;
     }
 
@@ -400,10 +437,18 @@ export function isAutostartInstalled(): boolean {
  * Linux and WSL2 require a reachable user systemd instance.
  */
 export function isAutostartSupported(): boolean {
+  return checkAutostartSupport().supported;
+}
+
+/**
+ * Like isAutostartSupported, but returns why it isn't when the answer is no —
+ * useful for surfacing real diagnostics (e.g., WSL2 bus unreachable) in onboarding.
+ */
+export function checkAutostartSupport(): SystemdProbeResult {
   if (process.platform === 'darwin') {
-    return true;
+    return { supported: true };
   }
-  return canUseSystemdUserService();
+  return probeSystemdUserService();
 }
 
 /**

@@ -4,30 +4,29 @@
  *
  * Usage:
  *   jarvis start [--port N] [-d|--detach]   Start the daemon
- *   jarvis stop                             Stop the running daemon
+ *   jarvis stop [--port N]                  Stop the running daemon
  *   jarvis status                           Show daemon status
- *   jarvis onboard                          Interactive setup wizard
- *   jarvis uninstall                        Remove JARVIS from this machine
+ *   jarvis uninstall                        Remove JARVIS (detects install method)
  *   jarvis doctor                           Check environment & connectivity
  *   jarvis version                          Print version
  *   jarvis help                             Show this help
+ *
+ * First-time setup happens in the dashboard at http://localhost:3142
+ * after `jarvis start` — there is no longer a CLI wizard.
  */
 
 import { join } from 'node:path';
-import { readFileSync, existsSync, openSync } from 'node:fs';
+import { existsSync, openSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { acquireLock, releaseLock, isLocked, getLogPath } from '../src/daemon/pid.ts';
 import { c } from '../src/cli/helpers.ts';
+import { ensurePortReleased, getConfiguredPort, resolveStopPort } from '../src/cli/lifecycle.ts';
+import { getInstalledVersion } from '../src/cli/version.ts';
 
 const PACKAGE_ROOT = join(import.meta.dir, '..');
 
 function getVersion(): string {
-  try {
-    const pkg = JSON.parse(readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf-8'));
-    return pkg.version || '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
+  return getInstalledVersion(PACKAGE_ROOT);
 }
 
 function printHelp(): void {
@@ -44,9 +43,8 @@ ${c.bold('Commands:')}
   ${c.cyan('restart')}   Restart the daemon (stop + start)
   ${c.cyan('status')}    Show daemon status
   ${c.cyan('logs')}      Tail the daemon log file
-  ${c.cyan('update')}    Update JARVIS to the latest version
-  ${c.cyan('onboard')}   Interactive first-time setup wizard
-  ${c.cyan('uninstall')} Remove JARVIS and local data from this machine
+  ${c.cyan('update')}    Update JARVIS (dispatches based on install method)
+  ${c.cyan('uninstall')} Remove JARVIS (dispatches based on install method)
   ${c.cyan('doctor')}    Check environment and connectivity
   ${c.cyan('version')}   Print version number
   ${c.cyan('help')}      Show this help message
@@ -69,7 +67,6 @@ ${c.bold('Examples:')}
   jarvis restart                Restart with same settings
   jarvis logs -f                Follow live log output
   jarvis update                 Update to latest version
-  jarvis onboard                Run the setup wizard
   jarvis uninstall              Remove JARVIS from this machine
   jarvis doctor                 Check if everything is working
 `);
@@ -104,6 +101,19 @@ async function cmdStart(args: string[]): Promise<void> {
   const dataDirIdx = args.indexOf('--data-dir');
   if (dataDirIdx !== -1 && args[dataDirIdx + 1]) {
     dataDir = args[dataDirIdx + 1]!;
+  }
+
+  // Friendly first-run hint — when no config exists yet, the daemon
+  // boots in "setup mode" and the dashboard's onboarding gate handles
+  // LLM/TTS/profile/tutorial. Print a one-liner so the user knows where
+  // to go (the browser auto-opens too unless --no-open is set).
+  const { existsSync: _exists } = await import('node:fs');
+  const { homedir } = await import('node:os');
+  const cfgPath = join(homedir(), '.jarvis', 'config.yaml');
+  if (!_exists(cfgPath)) {
+    console.log(c.cyan('First-run detected — finish setup in your browser:'));
+    console.log(c.dim(`  → http://localhost:${port ?? 3142}`));
+    console.log('');
   }
 
   if (!detach) {
@@ -174,10 +184,38 @@ async function cmdStart(args: string[]): Promise<void> {
   }
 }
 
-async function cmdStop(): Promise<void> {
+async function cmdStop(args: string[] = []): Promise<void> {
   const pid = isLocked();
+
+  // Parse `--port N` for the no-lockfile recovery path. Ignored when the
+  // lockfile recorded the daemon's actual port (authoritative).
+  let cliPort: number | undefined;
+  const portIdx = args.indexOf('--port');
+  if (portIdx !== -1 && args[portIdx + 1]) {
+    const parsed = parseInt(args[portIdx + 1]!, 10);
+    if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
+      console.error(c.red('Error: --port requires a number between 1 and 65535'));
+      process.exit(1);
+    }
+    cliPort = parsed;
+  }
+
+  const resolution = resolveStopPort({ cliPort });
+  const port = resolution.port;
+  if (resolution.source !== 'lockfile' && resolution.source !== 'default') {
+    console.log(c.dim(`  Using port ${port} (from ${resolution.source})`));
+  }
+
   if (!pid) {
-    console.log(c.yellow('JARVIS is not running.'));
+    const cleanup = await ensurePortReleased(port);
+    if (cleanup.terminated.length > 0 || cleanup.forced.length > 0) {
+      const details = cleanup.forced.length > 0
+        ? ` Force-killed lingering listener(s) on port ${port}: ${cleanup.forced.join(', ')}.`
+        : ` Cleaned up lingering listener(s) on port ${port}: ${cleanup.terminated.join(', ')}.`;
+      console.log(c.green(`✓ JARVIS was not locked, but the port is now clear.${details}`));
+    } else {
+      console.log(c.yellow('JARVIS is not running.'));
+    }
     return;
   }
 
@@ -197,8 +235,19 @@ async function cmdStop(): Promise<void> {
       try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
     }
 
+    const cleanup = await ensurePortReleased(port);
     releaseLock();
-    console.log(c.green('✓ JARVIS daemon stopped.'));
+    if (!cleanup.released) {
+      console.error(c.red(`✗ JARVIS stopped but port ${port} is still occupied.`));
+      process.exit(1);
+    }
+
+    const details = cleanup.forced.length > 0
+      ? ` Force-killed lingering listener(s) on port ${port}: ${cleanup.forced.join(', ')}.`
+      : cleanup.terminated.length > 0
+        ? ` Cleaned up lingering listener(s) on port ${port}: ${cleanup.terminated.join(', ')}.`
+        : '';
+    console.log(c.green(`✓ JARVIS daemon stopped.${details}`));
   } catch (err) {
     console.error(c.red(`Failed to stop process ${pid}: ${err}`));
     releaseLock();
@@ -212,12 +261,7 @@ function cmdStatus(): void {
 
     // Try to read the port from config
     try {
-      const { homedir } = require('node:os');
-      const configPath = join(homedir(), '.jarvis', 'config.yaml');
-      const YAML = require('yaml');
-      const text = readFileSync(configPath, 'utf-8');
-      const cfg = YAML.parse(text);
-      const port = cfg?.daemon?.port ?? 3142;
+      const port = getConfiguredPort();
       console.log(c.dim(`  Dashboard: http://localhost:${port}`));
     } catch {
       console.log(c.dim(`  Dashboard: http://localhost:3142`));
@@ -228,11 +272,6 @@ function cmdStatus(): void {
     console.log(`${c.red('●')} JARVIS is ${c.red('stopped')}`);
     console.log(c.dim(`  Start with: jarvis start`));
   }
-}
-
-async function cmdOnboard(): Promise<void> {
-  const { runOnboard } = await import('../src/cli/onboard.ts');
-  await runOnboard();
 }
 
 async function cmdDoctor(): Promise<void> {
@@ -293,79 +332,10 @@ function cmdLogs(args: string[]): void {
 }
 
 async function cmdUpdate(): Promise<void> {
-  console.log(c.cyan('Checking for updates...\n'));
-
-  // Get current version
-  const currentVersion = getVersion();
-  console.log(`  Current version: ${c.bold(currentVersion)}`);
-
-  // Check if daemon is running (we'll restart it after update)
-  const wasRunning = isLocked();
-
-  // Stop daemon if running
-  if (wasRunning) {
-    console.log(c.dim('  Stopping daemon before update...'));
-    try {
-      process.kill(wasRunning, 'SIGTERM');
-      releaseLock();
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch {
-      releaseLock();
-    }
-  }
-
-  // Update via git pull + bun install (not npm — package is not published)
-  console.log('');
-  const gitPull = Bun.spawnSync(['git', 'pull', '--ff-only'], {
-    cwd: PACKAGE_ROOT,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env },
-  });
-
-  if (gitPull.exitCode !== 0) {
-    const stderr = gitPull.stderr.toString();
-    // If not a git repo, try the install dir
-    const installDir = join(require('node:os').homedir(), '.jarvis', 'daemon');
-    const gitPull2 = Bun.spawnSync(['git', 'pull', '--ff-only'], {
-      cwd: installDir,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env },
-    });
-
-    if (gitPull2.exitCode !== 0) {
-      console.log(c.red('✗ Update failed (git pull):'));
-      console.log(c.dim(`  ${gitPull2.stderr.toString().trim() || stderr.trim()}`));
-      if (wasRunning) {
-        console.log(c.dim('\n  Restarting daemon...'));
-        await cmdStart(['--no-open']);
-      }
-      process.exit(1);
-    }
-  }
-
-  // Reinstall dependencies
-  const bunInstall = Bun.spawnSync(['bun', 'install'], {
-    cwd: PACKAGE_ROOT,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env },
-  });
-
-  if (bunInstall.exitCode !== 0) {
-    console.log(c.yellow('! Dependencies may need manual refresh: bun install'));
-  }
-
-  // Get new version
-  const newVersion = getVersion();
-  if (newVersion === currentVersion) {
-    console.log(c.green(`✓ Already on the latest version (${currentVersion})`));
-  } else {
-    console.log(c.green(`✓ Updated: ${currentVersion} → ${newVersion}`));
-  }
-
-  // Restart daemon if it was running
-  if (wasRunning) {
-    console.log(c.dim('\nRestarting daemon...'));
-    await cmdStart(['--no-open']);
+  const { runUpdate } = await import('../src/cli/update.ts');
+  const result = await runUpdate({ packageRoot: PACKAGE_ROOT });
+  if (result.exitCode !== 0) {
+    process.exit(result.exitCode);
   }
 }
 
@@ -406,7 +376,7 @@ switch (command) {
     await cmdStart(commandArgs);
     break;
   case 'stop':
-    await cmdStop();
+    await cmdStop(commandArgs);
     break;
   case 'restart':
     await cmdRestart(commandArgs);
@@ -423,19 +393,22 @@ switch (command) {
     await cmdUpdate();
     break;
   case 'onboard':
-    await cmdOnboard();
+    console.log(c.yellow('The CLI onboarding wizard has been retired.'));
+    console.log(c.dim('  First-time setup now happens in the dashboard:'));
+    console.log(c.dim('    1. Run: jarvis start'));
+    console.log(c.dim('    2. Open: http://localhost:3142'));
+    console.log(c.dim('  The dashboard guides you through LLM, voice, and profile setup.'));
     break;
   case 'doctor':
     await cmdDoctor();
     break;
   case 'uninstall':
-  case 'remove':
     await cmdUninstall();
     break;
   case 'version':
   case '-v':
   case '--version':
-    console.log(getVersion());
+    console.log(`v${getVersion()}`);
     break;
   case 'help':
   case '-h':

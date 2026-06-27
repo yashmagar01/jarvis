@@ -2,11 +2,26 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"log"
+	"runtime/debug"
 	"sync"
 	"time"
 )
+
+// goSafeObserver runs an observer in a goroutine guarded by recover(), so a
+// panic in one observer (e.g. unexpected subprocess output on some host) is
+// logged with its stack and contained — it can no longer take the whole sidecar
+// process down. The panic line names the observer so we can see the culprit.
+func goSafeObserver(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[observer panic] %s: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
 
 // EventSender sends sidecar events to the brain.
 // If binaryData is provided and exceeds the ref threshold, the transport
@@ -96,18 +111,26 @@ func readClipboardContent() (string, error) {
 // ── Screen Observer ──────────────────────────────────────────────────
 
 // ScreenObserver polls capture_screen at intervals and emits events on change.
+// The sidecar saves each capture locally, runs OCR (if available), and emits
+// a JSON-only event with the resulting metadata. The image bytes themselves
+// are never sent to the brain in the hot path — the brain fetches them on
+// demand via the fetch_capture RPC when cloud vision escalation fires.
 type ScreenObserver struct {
 	intervalMs         int
 	minChangeThreshold float64
 	previousBuffer     []byte
 	mu                 sync.Mutex
 	captureCount       int
+	ocrEnabled         bool
+	captureDir         string
 }
 
-func NewScreenObserver(cfg *SidecarConfig) *ScreenObserver {
+func NewScreenObserver(cfg *SidecarConfig, ocrAvailable bool) *ScreenObserver {
 	return &ScreenObserver{
 		intervalMs:         cfg.Awareness.ScreenIntervalMs,
 		minChangeThreshold: cfg.Awareness.MinChangeThreshold,
+		ocrEnabled:         cfg.Awareness.OCREnabled && ocrAvailable,
+		captureDir:         cfg.Awareness.CaptureDir,
 	}
 }
 
@@ -128,27 +151,15 @@ func (o *ScreenObserver) Run(ctx context.Context, send EventSender) {
 }
 
 func (o *ScreenObserver) capture(ctx context.Context, send EventSender) {
-	result, err := handleCaptureScreen(nil)
+	imageData, err := captureScreenBytes()
 	if err != nil {
 		log.Printf("[screen] Capture failed: %v", err)
 		return
-	}
-
-	// Extract the raw image data from the result
-	var imageData []byte
-	if inline, ok := result.Binary.(BinaryDataInline); ok && inline.Data != "" {
-		decoded, err := decodeBase64Data(inline.Data)
-		if err != nil {
-			log.Printf("[screen] Failed to decode screenshot: %v", err)
-			return
-		}
-		imageData = decoded
 	}
 	if len(imageData) == 0 {
 		return
 	}
 
-	// Compute sampled pixel diff
 	changePct := o.computePixelDiff(imageData)
 
 	o.mu.Lock()
@@ -165,22 +176,47 @@ func (o *ScreenObserver) capture(ctx context.Context, send EventSender) {
 	captureId := o.captureCount
 	o.mu.Unlock()
 
-	log.Printf("[screen] Change detected (%.1f%%), sending capture #%d (%d bytes)", changePct*100, captureId, len(imageData))
+	now := time.Now()
+	imagePath, err := saveCaptureToFile(o.captureDir, imageData, now)
+	if err != nil {
+		log.Printf("[screen] Failed to save capture: %v", err)
+		return
+	}
+
+	var ocrText string
+	var ocrDurationMs int64
+	if o.ocrEnabled {
+		ocr, err := platformOCR(imagePath)
+		if err != nil {
+			log.Printf("[screen] OCR failed: %v", err)
+		} else {
+			ocrText = ocr.Text
+			ocrDurationMs = ocr.DurationMs
+		}
+	}
+
+	appName, windowTitle := platformGetActiveWindow()
+
+	log.Printf("[screen] Change detected (%.1f%%), capture #%d (%d bytes, ocr %dms, %d chars)",
+		changePct*100, captureId, len(imageData), ocrDurationMs, len(ocrText))
 
 	event := SidecarEvent{
 		Type:      "sidecar_event",
 		EventType: "screen_capture",
-		Timestamp: time.Now().UnixMilli(),
+		Timestamp: now.UnixMilli(),
 		Priority:  "normal",
 		Payload: map[string]any{
 			"pixel_change_pct": changePct,
 			"capture_id":       captureId,
+			"image_path":       imagePath,
+			"ocr_text":         ocrText,
+			"ocr_duration_ms":  ocrDurationMs,
+			"app_name":         appName,
+			"window_title":     windowTitle,
 		},
 	}
 
-	// Pass raw binary data to the sender — it will choose inline base64 or
-	// binary ref protocol based on the size threshold.
-	if err := send(ctx, event, imageData); err != nil {
+	if err := send(ctx, event, nil); err != nil {
 		log.Printf("[screen] Failed to send event: %v", err)
 	}
 }
@@ -212,25 +248,11 @@ func (o *ScreenObserver) computePixelDiff(current []byte) float64 {
 	return float64(changed) / float64(total)
 }
 
-func decodeBase64Data(s string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(s)
-}
-
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
 	return s[:maxLen] + "..."
-}
-
-func padTo36(s string) string {
-	for len(s) < 36 {
-		s += "0"
-	}
-	if len(s) > 36 {
-		s = s[:36]
-	}
-	return s
 }
 
 // ── Window Observer ─────────────────────────────────────────────────
@@ -339,11 +361,30 @@ func StartObservers(ctx context.Context, cfg *SidecarConfig, availableCaps []Sid
 
 	if caps[CapClipboard] {
 		observer := NewClipboardObserver(2000)
-		go observer.Run(ctx, send)
+		goSafeObserver("clipboard", func() { observer.Run(ctx, send) })
+	}
+
+	if caps[CapFileWatch] {
+		// Watch the user's home, excluding the shared ~/.jarvis data dir so the
+		// sidecar's own captures/logs don't generate awareness noise.
+		fo := NewFileObserver([]string{homeDir()}, []string{configDir}, 5000)
+		goSafeObserver("file-watcher", func() { fo.Run(ctx, send) })
+	}
+
+	if caps[CapProcesses] {
+		po := NewProcessObserver(5000)
+		goSafeObserver("processes", func() { po.Run(ctx, send) })
+	}
+
+	if caps[CapNotifications] {
+		no := NewNotificationObserver()
+		goSafeObserver("notifications", func() { no.Run(ctx, send) })
 	}
 
 	if caps[CapAwareness] {
-		go NewScreenObserver(cfg).Run(ctx, send)
-		go NewWindowObserver(cfg).Run(ctx, send)
+		so := NewScreenObserver(cfg, caps[CapOCR])
+		goSafeObserver("screen", func() { so.Run(ctx, send) })
+		wo := NewWindowObserver(cfg)
+		goSafeObserver("window", func() { wo.Run(ctx, send) })
 	}
 }

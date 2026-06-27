@@ -12,6 +12,16 @@ const (
 	CapScreenshot SidecarCapability = "screenshot"
 	CapSystemInfo SidecarCapability = "system_info"
 	CapAwareness  SidecarCapability = "awareness"
+	CapOCR        SidecarCapability = "ocr"
+	CapWindows    SidecarCapability = "windows"
+	CapPebble     SidecarCapability = "pebble"
+	CapSubPebble  SidecarCapability = "sub_pebble"
+	// Host-sensing observers (moved out of the brain in the ambient/pebble
+	// model — the sidecar is the agent that runs on the user's machine, so all
+	// machine-level observation lives here and streams to the brain).
+	CapFileWatch     SidecarCapability = "file_watch"
+	CapProcesses     SidecarCapability = "processes"
+	CapNotifications SidecarCapability = "notifications"
 )
 
 // AwarenessConfig controls screen and window observer behavior.
@@ -20,6 +30,8 @@ type AwarenessConfig struct {
 	WindowIntervalMs   int     `yaml:"window_interval_ms"`
 	MinChangeThreshold float64 `yaml:"min_change_threshold"`
 	StuckThresholdMs   int     `yaml:"stuck_threshold_ms"`
+	OCREnabled         bool    `yaml:"ocr_enabled"`
+	CaptureDir         string  `yaml:"capture_dir"`
 }
 
 // SidecarTokenClaims is the JWT payload from the brain.
@@ -30,7 +42,11 @@ type SidecarTokenClaims struct {
 	Name  string `json:"name"`
 	Brain string `json:"brain"`
 	JWKS  string `json:"jwks"`
-	Iat   int64  `json:"iat"`
+	// Bid is the brain's anonymous telemetry id, stamped by the brain at
+	// enrollment so the sidecar can report which brain it belongs to. Empty on
+	// tokens issued before sidecar telemetry existed (re-enroll to populate).
+	Bid string `json:"bid"`
+	Iat int64  `json:"iat"`
 }
 
 // RPCRequest is a message from brain to sidecar.
@@ -48,16 +64,16 @@ type BinaryData interface {
 
 // BinaryDataInline holds inline base64 binary data (e.g. screenshot < 256KB).
 type BinaryDataInline struct {
-	Type     string `json:"type"`      // always "inline"
+	Type     string `json:"type"` // always "inline"
 	MimeType string `json:"mime_type"`
-	Data     string `json:"data"`      // base64-encoded
+	Data     string `json:"data"` // base64-encoded
 }
 
 func (BinaryDataInline) binaryMarker() {}
 
 // BinaryDataRef references binary data sent in a separate WebSocket binary frame.
 type BinaryDataRef struct {
-	Type     string `json:"type"`      // always "ref"
+	Type     string `json:"type"` // always "ref"
 	RefID    string `json:"ref_id"`
 	MimeType string `json:"mime_type"`
 	Size     int    `json:"size"`
@@ -77,10 +93,14 @@ type SidecarEvent struct {
 
 // SidecarRegistration is sent on connect.
 type SidecarRegistration struct {
-	Type                    string                  `json:"type"`
-	Hostname                string                  `json:"hostname"`
-	OS                      string                  `json:"os"`
-	Platform                string                  `json:"platform"`
+	Type     string `json:"type"`
+	Hostname string `json:"hostname"`
+	OS       string `json:"os"`
+	Platform string `json:"platform"`
+	// Version is the sidecar's own semver (sidecarVersion, "dev" for unstamped
+	// local builds). The brain classifies it against its MIN/RECOMMENDED floors
+	// to accept / suggest-update / hard-block on register.
+	Version                 string                  `json:"version"`
 	Capabilities            []SidecarCapability     `json:"capabilities"`
 	UnavailableCapabilities []UnavailableCapability `json:"unavailable_capabilities,omitempty"`
 }
@@ -95,11 +115,35 @@ type SidecarCapabilitiesUpdate struct {
 // SidecarConfig is the YAML config file structure.
 type SidecarConfig struct {
 	Token        string              `yaml:"token"`
+	Brain        string              `yaml:"brain"`
 	Capabilities []SidecarCapability `yaml:"capabilities"`
 	Terminal     TerminalConfig      `yaml:"terminal"`
 	Filesystem   FilesystemConfig    `yaml:"filesystem"`
 	Browser      BrowserConfig       `yaml:"browser"`
 	Awareness    AwarenessConfig     `yaml:"awareness"`
+	Preferences  PreferencesConfig   `yaml:"preferences"`
+	Telemetry    TelemetryConfig     `yaml:"telemetry"`
+}
+
+// TelemetryConfig controls anonymous sidecar usage metrics. Independent of the
+// brain's telemetry: it does NOT honor the brain's JARVIS_TELEMETRY/DO_NOT_TRACK
+// env vars. Enabled is a pointer so a config file without the key reads as "on"
+// (the opt-out default) rather than a zero-value false. Toggle it from the
+// settings window's Privacy section or with JARVIS_SIDECAR_TELEMETRY=0.
+type TelemetryConfig struct {
+	// omitempty so an unset (default-on) config doesn't persist `enabled: null`;
+	// an explicit true/false is a non-nil pointer and is still written.
+	Enabled *bool `yaml:"enabled,omitempty"`
+}
+
+// PreferencesConfig holds user-facing sidecar preferences edited from the local
+// settings window, grouped by UI category. Add fields over time.
+type PreferencesConfig struct {
+	// General
+	StartAtStartup bool `yaml:"start_at_startup"` // register the sidecar to launch on login
+	// Style
+	EtherealPebble      bool `yaml:"ethereal_pebble"`       // fade the pebble out while idle, pop it back on activity
+	EtherealIdleSeconds int  `yaml:"ethereal_idle_seconds"` // idle time before the pebble fades out (default 5)
 }
 
 type TerminalConfig struct {
@@ -114,14 +158,34 @@ type FilesystemConfig struct {
 }
 
 type BrowserConfig struct {
-	CDPPort    int    `yaml:"cdp_port"`
+	// ExecutablePath optionally pins the Chromium-based browser to drive. When
+	// empty the sidecar auto-detects one (the OS default browser if it is
+	// Chromium-based, otherwise a known install: Chrome, Edge, Brave, ...).
+	ExecutablePath string `yaml:"executable_path"`
+	// ProfileDir is the dedicated user-data dir for Jarvis's automation browser
+	// (kept separate from the user's own profile). Defaults to a temp dir.
 	ProfileDir string `yaml:"profile_dir"`
+	// CDPPort is retained for backward-compatible config files but is no longer
+	// used: the sidecar drives the browser over an inherited CDP pipe
+	// (--remote-debugging-pipe), not a TCP port.
+	CDPPort int `yaml:"cdp_port"`
 }
 
 // RPCResult is returned by handlers.
+//
+// Handlers returning binary data should set BinaryRaw/BinaryMime (raw bytes)
+// rather than pre-encoding into Binary. sendResult then inlines small payloads
+// as base64 and routes large ones (>= the inline threshold) through a separate
+// binary WebSocket frame, keeping the JSON message small. Binary remains for
+// callers that have already built an inline descriptor.
 type RPCResult struct {
 	Result any        `json:"result"`
 	Binary BinaryData `json:"binary,omitempty"`
+
+	// BinaryRaw, when non-nil, is the raw binary payload; sendResult chooses
+	// inline-vs-ref transport. Not serialized — it never travels as JSON.
+	BinaryRaw  []byte `json:"-"`
+	BinaryMime string `json:"-"`
 }
 
 // RPCHandler processes an RPC request.

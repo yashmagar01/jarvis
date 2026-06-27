@@ -7,11 +7,38 @@ import type {
   LLMTool,
   LLMToolCall,
 } from './provider.ts';
+import { classifyHttpStatus } from './provider.ts';
 import { compactHistory, calculateHistoryBudget } from './history.ts';
+
+/**
+ * OpenAI reasoning models reject any `temperature` other than the default (1):
+ *   400 invalid_request_error "Unsupported value: 'temperature' does not
+ *   support 0.6 with this model. Only the default (1) value is supported."
+ * Unlike Anthropic's check (presence of the field), this one is on the VALUE —
+ * but the only accepted value is the default, so the fix is the same: omit the
+ * field and let the API apply its default.
+ *
+ * Covers the o-series (o1/o3/o4-mini/o3-pro…) and the GPT-5 reasoning family.
+ * `gpt-5-chat*` is the non-reasoning variant and DOES accept a custom
+ * temperature, so it's excluded. Add new families here if you see that 400.
+ */
+export function modelRejectsCustomTemperature(model: string): boolean {
+  const id = model.toLowerCase();
+  if (/^o\d/.test(id)) return true;
+  if (id.startsWith('gpt-5') && !id.startsWith('gpt-5-chat')) return true;
+  return false;
+}
+
+type OpenAIContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } };
 
 type OpenAIMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
+  // GPT-4o + later vision models accept an array of content parts on
+  // user messages so images can travel inline. System / assistant /
+  // tool messages stick to plain string for compatibility.
+  content: string | OpenAIContentPart[];
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
 };
@@ -81,13 +108,23 @@ type OpenAIStreamChunk = {
 
 export class OpenAIProvider implements LLMProvider {
   name = 'openai';
-  private apiKey: string;
-  private defaultModel: string;
-  private apiUrl = 'https://api.openai.com/v1/chat/completions';
+  protected apiKey: string;
+  protected defaultModel: string;
+  protected baseUrl: string;
+  protected get apiUrl(): string {
+    return `${this.baseUrl}/chat/completions`;
+  }
+  protected get modelsUrl(): string {
+    return `${this.baseUrl}/models`;
+  }
+  protected get errorLabel(): string {
+    return 'OpenAI';
+  }
 
-  constructor(apiKey: string, defaultModel = 'gpt-4o') {
+  constructor(apiKey: string, defaultModel = 'gpt-4o', baseUrl = 'https://api.openai.com/v1') {
     this.apiKey = apiKey;
     this.defaultModel = defaultModel;
+    this.baseUrl = baseUrl.replace(/\/$/, '');
   }
 
   async chat(messages: LLMMessage[], options: LLMOptions = {}): Promise<LLMResponse> {
@@ -102,25 +139,29 @@ export class OpenAIProvider implements LLMProvider {
       messages: this.convertMessages(compactedMessages),
     };
 
-    if (temperature !== undefined) body.temperature = temperature;
-    if (max_tokens !== undefined) body.max_tokens = max_tokens;
+    if (temperature !== undefined && !modelRejectsCustomTemperature(model)) {
+      body.temperature = temperature;
+    }
+    if (max_tokens !== undefined) body.max_completion_tokens = max_tokens;
     if (tools && tools.length > 0) {
       body.tools = this.convertTools(tools);
       body.tool_choice = tool_choice || 'auto';  // Enable tool calling
     }
 
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
+
     const response = await fetch(this.apiUrl, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify(body),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`OpenAI API error (${response.status}): ${errorText}`);
+      throw new Error(`${this.errorLabel} API error (${response.status}): ${errorText}`);
     }
 
     const data = await response.json() as OpenAIResponse;
@@ -140,30 +181,38 @@ export class OpenAIProvider implements LLMProvider {
       stream: true,
     };
 
-    if (temperature !== undefined) body.temperature = temperature;
-    if (max_tokens !== undefined) body.max_tokens = max_tokens;
+    if (temperature !== undefined && !modelRejectsCustomTemperature(model)) {
+      body.temperature = temperature;
+    }
+    if (max_tokens !== undefined) body.max_completion_tokens = max_tokens;
     if (tools && tools.length > 0) {
       body.tools = this.convertTools(tools);
       body.tool_choice = tool_choice || 'auto';  // Enable tool calling
     }
 
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
+
     const response = await fetch(this.apiUrl, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify(body),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      yield { type: 'error', error: `OpenAI API error (${response.status}): ${errorText}` };
+      yield {
+        type: 'error',
+        error: `${this.errorLabel} API error (${response.status}): ${errorText}`,
+        code: classifyHttpStatus(response.status),
+      };
       return;
     }
 
     if (!response.body) {
-      yield { type: 'error', error: 'No response body' };
+      yield { type: 'error', error: 'No response body', code: 'network' };
       return;
     }
 
@@ -247,7 +296,7 @@ export class OpenAIProvider implements LLMProvider {
           toolCalls.push(toolCall);
           yield { type: 'tool_call', tool_call: toolCall };
         } catch (err) {
-          yield { type: 'error', error: `Failed to parse tool call arguments: ${err}` };
+          yield { type: 'error', error: `Failed to parse tool call arguments: ${err}`, code: 'bad_request' };
         }
       }
 
@@ -263,17 +312,15 @@ export class OpenAIProvider implements LLMProvider {
         },
       };
     } catch (err) {
-      yield { type: 'error', error: `Stream error: ${err}` };
+      yield { type: 'error', error: `Stream error: ${err}`, code: 'network' };
     }
   }
 
   async listModels(): Promise<string[]> {
     try {
-      const response = await fetch('https://api.openai.com/v1/models', {
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-        },
-      });
+      const headers: Record<string, string> = {};
+      if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
+      const response = await fetch(this.modelsUrl, { headers });
 
       if (!response.ok) {
         throw new Error(`Failed to list models: ${response.status}`);
@@ -298,13 +345,30 @@ export class OpenAIProvider implements LLMProvider {
 
   private convertMessages(messages: LLMMessage[]): OpenAIMessage[] {
     return messages.map(m => {
-      const text = typeof m.content === 'string'
-        ? m.content
-        : m.content.map((b) => b.type === 'text' ? b.text : '[image]').join('\n');
+      // Multi-modal user messages (T19 region capture) need the image to
+      // ride alongside the text. OpenAI's vision API takes a content
+      // array of {type:'text'} / {type:'image_url'} parts on user
+      // messages. Other roles stay string for compat.
+      let content: string | OpenAIContentPart[];
+      if (typeof m.content === 'string') {
+        content = m.content;
+      } else if (m.role === 'user' && m.content.some(b => b.type === 'image')) {
+        content = m.content.map<OpenAIContentPart>((b) => {
+          if (b.type === 'text') return { type: 'text', text: b.text };
+          return {
+            type: 'image_url',
+            image_url: {
+              url: `data:${b.source.media_type};base64,${b.source.data}`,
+            },
+          };
+        });
+      } else {
+        content = m.content.map((b) => b.type === 'text' ? b.text : '[image]').join('\n');
+      }
       const msg: OpenAIMessage = {
         role: m.role as 'system' | 'user' | 'assistant' | 'tool',
         // When assistant made tool calls, content must be null (not empty string)
-        content: (m.tool_calls && m.tool_calls.length > 0) ? '' : text,
+        content: (m.tool_calls && m.tool_calls.length > 0) ? '' : content,
       };
       if (m.tool_calls && m.tool_calls.length > 0) {
         msg.tool_calls = m.tool_calls.map(tc => ({

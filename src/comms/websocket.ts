@@ -1,6 +1,7 @@
 import type { Server, ServerWebSocket } from 'bun';
 import { timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
+import { isWithin } from '../util/path.ts';
 import type { SidecarManager } from '../sidecar/manager.ts';
 
 /** Constant-time string comparison to prevent timing attacks */
@@ -11,10 +12,56 @@ function safeCompare(a: string, b: string): boolean {
 
 export type WSMessage = {
   type: 'chat' | 'command' | 'status' | 'stream' | 'error' | 'notification'
-      | 'tts_start' | 'tts_end' | 'voice_start' | 'voice_end'
+      | 'tts_start' | 'tts_text' | 'tts_end' | 'voice_start' | 'voice_end' | 'voice_text'
+      | 'interview_start' | 'interview_user_message' | 'interview_assistant' | 'interview_done' | 'interview_error'
+      | 'thinking_start' | 'thinking_end'
       | 'workflow_event'
       | 'goal_event'
-      | 'site_event';
+      | 'site_event'
+      // Premium realtime voice (gpt-realtime-2). `realtime_status` reports
+      // session live/closed/error for the UI indicator; `realtime_transcript`
+      // streams user/assistant transcript text. See docs/GPT_REALTIME_2_INTEGRATION.md.
+      | 'realtime_status' | 'realtime_transcript'
+      // Conv-tier task lifecycle event. Fires when the conversation LLM
+      // delegates work to a task tier and during its life: started, then
+      // completed | failed | cancelled. Tasks that pause for clarification
+      // also fire a task_started event when they later resume.
+      //
+      // Payload:
+      //   {
+      //     type: 'task_started' | 'task_completed' | 'task_failed' | 'task_cancelled',
+      //     task_id: string,        // stable id; same across pause + resume
+      //     template: 'research' | 'code' | 'plan' | 'write' | 'general',
+      //     intent: string,         // conv LLM's paraphrase of what to do
+      //     status: 'running' | 'completed' | 'failed' | 'cancelled',
+      //     elapsedMs: number,      // wall-clock since task started
+      //     summary?: string,       // present on completed/failed/cancelled
+      //   }
+      //
+      // Consuming (e.g. for a status pill component):
+      //   const ws = new WebSocket('ws://host:port/ws');
+      //   ws.onmessage = (e) => {
+      //     const msg = JSON.parse(e.data);
+      //     if (msg.type !== 'task_event') return;
+      //     const p = msg.payload;
+      //     switch (p.type) {
+      //       case 'task_started':   pillsByTaskId.set(p.task_id, { template: p.template, intent: p.intent, startedAt: Date.now() }); break;
+      //       case 'task_completed':
+      //       case 'task_failed':
+      //       case 'task_cancelled': pillsByTaskId.delete(p.task_id); break;
+      //     }
+      //   };
+      //
+      // Note: a task can fire task_started multiple times (initial dispatch
+      // + each resume after a needs_input pause). Treat task_started as
+      // "show pill"; treat any terminal event as "hide pill". Pauses
+      // (needs_input) are NOT emitted as task_event - the conv LLM handles
+      // them by asking the user via the regular chat stream.
+      | 'task_event'
+      // Emitted when a pending voice confirmation (clarifier / repeat-back)
+      // expires from the server-side TTL sweep. Payload: { id: string }.
+      // Clients should dismiss the corresponding card from their UI.
+      | 'voice_confirmation_expired';
   payload: unknown;
   id?: string;
   priority?: 'urgent' | 'normal' | 'low';
@@ -176,22 +223,62 @@ export class WebSocketServer {
           return new Response('WebSocket upgrade failed', { status: 500 });
         }
 
+        // 0b. Sidecar access-token mint. Authenticated by the long-lived
+        //     enrollment JWT (Authorization: Bearer) — this and /sidecar/connect
+        //     are the ONLY places that credential is accepted. Returns a
+        //     short-lived access token the sidecar injects into its panel
+        //     webviews; everything on the data plane (/api, /ws) authenticates
+        //     with that access token, never the enrollment JWT.
+        if (pathname === '/sidecar/token' && req.method === 'POST' && self.sidecarManager) {
+          const authHeader = req.headers.get('Authorization');
+          const enrollTok = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+          const claims = enrollTok ? await self.sidecarManager.validateToken(enrollTok) : null;
+          if (!claims?.sid) {
+            return new Response('Invalid or revoked token', { status: 403 });
+          }
+          const minted = await self.sidecarManager.issueAccessToken(claims.sid);
+          if (!minted) {
+            return Response.json({ error: 'mint failed' }, { status: 500 });
+          }
+          return Response.json({ access_token: minted.token, expires_in: minted.expiresIn });
+        }
+
         // 1. Auth check (if configured)
         if (self.authToken && !isPublicRoute(pathname, req.method)) {
+          // A request is authorized by EITHER the dashboard token OR a valid
+          // short-lived sidecar ACCESS token. The sidecar's panel webviews carry
+          // an access token (minted from the enrollment JWT via /sidecar/token)
+          // so their content fetches authenticate without the dashboard token.
+          // The long-lived enrollment JWT is deliberately NOT accepted here —
+          // only on /sidecar/connect and the mint endpoint — so a leaked panel
+          // credential is bounded to the access-token TTL instead of forever.
+          const accepts = async (tok: string | null): Promise<boolean> => {
+            if (!tok) return false;
+            if (safeCompare(tok, self.authToken!)) return true;
+            if (self.sidecarManager && (await self.sidecarManager.verifyAccessToken(tok))) return true;
+            return false;
+          };
           const cookieToken = getCookie(req, 'token');
-          if (!cookieToken || !safeCompare(cookieToken, self.authToken)) {
+          if (!(await accepts(cookieToken))) {
             // Check ?token= query param — set cookie via Set-Cookie and redirect
             const queryToken = url.searchParams.get('token');
-            if (queryToken && safeCompare(queryToken, self.authToken)) {
+            if (await accepts(queryToken)) {
               const cleanParams = new URLSearchParams(url.searchParams);
               cleanParams.delete('token');
               const qs = cleanParams.toString();
               const redirectTo = pathname + (qs ? '?' + qs : '');
+              // Mark the cookie Secure whenever the connection is TLS (directly,
+              // or terminated upstream and forwarded) so the token can't leak
+              // over a downgraded http request to the same host.
+              const xfProto = (req.headers.get('x-forwarded-proto') ?? '').split(',')[0]?.trim();
+              const isHttps = url.protocol === 'https:' || xfProto === 'https';
+              const cookie = `token=${queryToken}; Path=/; SameSite=Lax; HttpOnly` +
+                (isHttps ? '; Secure' : '');
               return new Response(null, {
                 status: 302,
                 headers: {
                   'Location': redirectTo || '/',
-                  'Set-Cookie': `token=${queryToken}; Path=/; SameSite=Lax; HttpOnly`,
+                  'Set-Cookie': cookie,
                 },
               });
             }
@@ -207,12 +294,24 @@ export class WebSocketServer {
         }
 
         // 2. WebSocket upgrade — validate Origin to block cross-origin connections
-        //    (e.g., dev server iframes on different ports attempting ws://localhost:3142/ws)
+        //    (e.g., dev server iframes on different ports attempting ws://localhost:3142/ws).
+        //    Allow when Origin's host matches the request Host header, which covers
+        //    reverse-proxy deployments (Opencove, Cloudflare tunnel, ngrok, etc.).
         if (pathname === '/ws') {
           const origin = req.headers.get('origin');
-          const expectedOrigin = self.corsOrigin || `http://localhost:${self.port}`;
-          if (origin && origin !== expectedOrigin) {
-            return new Response('Forbidden: origin mismatch', { status: 403 });
+          if (origin) {
+            const expectedOrigin = self.corsOrigin || `http://localhost:${self.port}`;
+            let sameHost = false;
+            try {
+              const originHost = new URL(origin).host;
+              const requestHost = req.headers.get('host');
+              sameHost = !!requestHost && originHost === requestHost;
+            } catch {
+              sameHost = false;
+            }
+            if (origin !== expectedOrigin && !sameHost) {
+              return new Response('Forbidden: origin mismatch', { status: 403 });
+            }
           }
           const success = server.upgrade(req, { data: {} });
           if (success) return undefined;
@@ -316,14 +415,14 @@ export class WebSocketServer {
           let filePath: string;
 
           if (pathname === '/' || pathname === '/index.html') {
-            filePath = path.join(self.staticDir, 'index.html');
+            filePath = path.resolve(self.staticDir, 'index.html');
           } else {
             // Serve JS/CSS/assets — resolve and validate within staticDir
             filePath = path.resolve(self.staticDir, '.' + pathname);
           }
 
           // Prevent path traversal outside staticDir
-          if (!filePath.startsWith(path.resolve(self.staticDir) + path.sep) && filePath !== path.resolve(self.staticDir, 'index.html')) {
+          if (!isWithin(filePath, path.resolve(self.staticDir))) {
             return new Response('Forbidden', { status: 403 });
           }
 
@@ -341,7 +440,7 @@ export class WebSocketServer {
         if (self.publicDir) {
           const publicPath = path.resolve(self.publicDir, '.' + pathname);
           // Prevent path traversal outside publicDir
-          if (!publicPath.startsWith(path.resolve(self.publicDir) + path.sep)) {
+          if (!isWithin(publicPath, path.resolve(self.publicDir))) {
             return new Response('Forbidden', { status: 403 });
           }
           const publicFile = Bun.file(publicPath);

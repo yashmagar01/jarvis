@@ -279,12 +279,15 @@ func handleTypeText(params map[string]any) (*RPCResult, error) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Escape backslashes and double-quotes for AppleScript string literal
-	escaped := strings.ReplaceAll(text, "\\", "\\\\")
-	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
-
-	script := fmt.Sprintf(`tell application "System Events" to keystroke "%s"`, escaped)
-	if _, err := runOsascript(script, 10*time.Second); err != nil {
+	// Pass the text as an argv item rather than interpolating it into the
+	// script source. osascript args are real arguments (no shell, no string
+	// literal), so newlines/quotes/backslashes in `text` are data and cannot
+	// break out of the keystroke statement -- this is what prevents
+	// AppleScript injection via attacker/LLM-controlled text.
+	script := `on run argv
+	tell application "System Events" to keystroke (item 1 of argv)
+end run`
+	if _, err := runOsascriptArgs(script, 10*time.Second, text); err != nil {
 		return nil, fmt.Errorf("type_text failed: %w", err)
 	}
 
@@ -314,62 +317,75 @@ func handleLaunchApp(params map[string]any) (*RPCResult, error) {
 	if executable == "" {
 		return nil, fmt.Errorf("missing required parameter: executable")
 	}
-	args, _ := params["args"].(string)
+	args, err := extractArgs(params)
+	if err != nil {
+		return nil, fmt.Errorf("launch_app: %w", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	// Use "open -a" for .app bundles; fall back to direct exec for plain binaries
-	var cmd *exec.Cmd
 	if strings.HasSuffix(executable, ".app") || !strings.Contains(executable, "/") {
 		// Looks like an app name or .app bundle — use open -a
+		var cmd *exec.Cmd
 		if args != "" {
 			cmd = exec.CommandContext(ctx, "open", "-a", executable, "--args", args)
 		} else {
 			cmd = exec.CommandContext(ctx, "open", "-a", executable)
 		}
-	} else {
-		// Absolute/relative path to a binary
-		if args != "" {
-			cmd = exec.CommandContext(ctx, executable, strings.Fields(args)...)
-		} else {
-			cmd = exec.CommandContext(ctx, executable)
+
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("launch_app: open -a %q failed: %w", executable, err)
 		}
-		// Run detached so the sidecar doesn't wait for the child process to exit
-		cmd.Start() //nolint:errcheck
-		// Give it a moment to start, then look up PID
+
+		// Wait briefly for the app to register, then resolve its PID
 		time.Sleep(500 * time.Millisecond)
 
-		// Resolve PID via pgrep using the base name
 		name := executable
-		if idx := strings.LastIndex(executable, "/"); idx >= 0 {
-			name = executable[idx+1:]
+		if strings.HasSuffix(name, ".app") {
+			name = name[:len(name)-4]
 		}
+		if idx := strings.LastIndex(name, "/"); idx >= 0 {
+			name = name[idx+1:]
+		}
+
 		pgrepOut, _ := exec.Command("pgrep", "-n", name).Output()
 		pidStr := strings.TrimSpace(string(pgrepOut))
 		pid, _ := strconv.Atoi(pidStr)
+		if pid == 0 {
+			return nil, fmt.Errorf("launch_app: open -a %q succeeded but process PID could not be resolved via pgrep %q", executable, name)
+		}
 		return &RPCResult{Result: map[string]any{"success": true, "pid": pid, "name": name}}, nil
 	}
 
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("launch_app failed: %w", err)
+	// Absolute/relative path to a binary — start detached
+	var cmd *exec.Cmd
+	if args != "" {
+		cmd = exec.CommandContext(ctx, executable, strings.Fields(args)...)
+	} else {
+		cmd = exec.CommandContext(ctx, executable)
 	}
 
-	// Wait briefly for the app to start, then resolve its PID
-	time.Sleep(500 * time.Millisecond)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("launch_app: failed to start %q: %w", executable, err)
+	}
 
-	// Strip .app suffix for pgrep name lookup
+	// Detach: don't wait, let the child run independently
+	go func() { _ = cmd.Wait() }()
+
+	pid := 0
+	if cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+	if pid == 0 {
+		return nil, fmt.Errorf("launch_app: started %q but could not obtain process ID", executable)
+	}
+
 	name := executable
-	if strings.HasSuffix(name, ".app") {
-		name = name[:len(name)-4]
+	if idx := strings.LastIndex(executable, "/"); idx >= 0 {
+		name = executable[idx+1:]
 	}
-	if idx := strings.LastIndex(name, "/"); idx >= 0 {
-		name = name[idx+1:]
-	}
-
-	pgrepOut, _ := exec.Command("pgrep", "-n", name).Output()
-	pidStr := strings.TrimSpace(string(pgrepOut))
-	pid, _ := strconv.Atoi(pidStr)
 
 	return &RPCResult{Result: map[string]any{"success": true, "pid": pid, "name": name}}, nil
 }
@@ -502,6 +518,22 @@ func runOsascript(script string, timeout time.Duration) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// runOsascriptArgs runs an AppleScript that reads its inputs from `argv`, passing
+// caller-supplied values as process arguments (after `--`) rather than interpolating
+// them into the script source. This makes the values data, not code, so they cannot
+// inject AppleScript. The script must be an `on run argv ... end run` handler.
+func runOsascriptArgs(script string, timeout time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmdArgs := append([]string{"-e", script, "--"}, args...)
+	cmd := exec.CommandContext(ctx, "osascript", cmdArgs...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // runOsascriptJS runs a JXA (JavaScript for Automation) script via osascript -l JavaScript.
 func runOsascriptJS(script string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -620,3 +652,5 @@ func toInt(v any) int {
 	}
 	return 0
 }
+
+

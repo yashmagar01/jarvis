@@ -8,6 +8,7 @@
 import type { HealthMonitor } from './health.ts';
 import type { AgentService } from './agent-service.ts';
 import type { JarvisConfig } from '../config/types.ts';
+import { resolveRealtimeVoice, DEFAULT_BLOCKED_CATEGORIES } from '../config/realtime.ts';
 import type { EntityType } from '../vault/entities.ts';
 import type { CommitmentPriority, CommitmentStatus } from '../vault/commitments.ts';
 import type { ObservationType } from '../vault/observations.ts';
@@ -18,15 +19,21 @@ import type { AuditTrail, AuthorityDecisionType } from '../authority/audit.ts';
 import type { AuthorityLearner } from '../authority/learning.ts';
 import type { EmergencyController } from '../authority/emergency.ts';
 import type { DeferredExecutor } from '../authority/deferred-executor.ts';
+import { applyQuickOverride } from '../authority/quick-override.ts';
 import type { ActionCategory } from '../roles/authority.ts';
 
-import { findEntities, getEntity, searchEntitiesByName } from '../vault/entities.ts';
-import { findFacts } from '../vault/facts.ts';
-import { findRelationships, getEntityRelationships } from '../vault/relationships.ts';
+import { findEntities, getEntity, searchEntitiesByName, createEntity } from '../vault/entities.ts';
+import { findFacts, createFact } from '../vault/facts.ts';
+import { findRelationships, getEntityRelationships, createRelationship } from '../vault/relationships.ts';
+import { listFlows } from '../workflows/db/repos/flow.ts';
+import { getFlowVersion, getLatestDraft } from '../workflows/db/repos/flow-version.ts';
+
+const VALID_ENTITY_TYPES = new Set(['person', 'project', 'tool', 'place', 'concept', 'event']);
 import { getDb } from '../vault/schema.ts';
 import { findCommitments, getUpcoming, createCommitment, getCommitment, updateCommitmentStatus, reorderCommitments } from '../vault/commitments.ts';
 import { getOrCreateConversation, getMessages, getRecentConversation } from '../vault/conversations.ts';
-import { getRecentObservations } from '../vault/observations.ts';
+import { getRecentObservations, summarizeObservation } from '../vault/observations.ts';
+import { listAgentActivity, countAgentActivity } from '../vault/agent-activity.ts';
 import { getPersonality } from '../personality/model.ts';
 import { clearUserProfile, getUserProfile, saveUserProfile } from '../vault/user-profile.ts';
 import {
@@ -43,14 +50,17 @@ import {
 } from '../vault/content-pipeline.ts';
 import {
   assignPersistentAgentTask,
+  HttpError,
   listPersistentAgents,
   spawnPersistentAgent,
   terminatePersistentAgent,
 } from '../actions/tools/agents.ts';
+import type { AsyncTask } from '../agents/task-manager.ts';
 
 import { mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { isWithin } from '../util/path.ts';
 
 // --- Security helpers ---
 
@@ -62,13 +72,6 @@ function escapeHtml(str: string): string {
 /** Sanitize a single path segment — strip directory separators and dot-dot sequences */
 function sanitizePathSegment(segment: string): string {
   return path.basename(segment.replace(/\.\./g, ''));
-}
-
-/** Validate that a resolved path is within the expected base directory */
-function isWithinBase(resolvedPath: string, baseDir: string): boolean {
-  const normalizedBase = path.resolve(baseDir) + path.sep;
-  const normalizedPath = path.resolve(resolvedPath);
-  return normalizedPath.startsWith(normalizedBase) || normalizedPath === path.resolve(baseDir);
 }
 
 /** Escape SQL LIKE wildcard characters in user input */
@@ -112,6 +115,17 @@ import {
 } from '../cli/autostart.ts';
 
 export type ApiContext = {
+  /**
+   * Daemon process boot time (Date.now() at start). Surfaced via the
+   * onboarding-status endpoint so the dashboard can detect when setup
+   * was completed AFTER the daemon started — that's the case where
+   * the daemon is still in setup-mode and needs a restart for
+   * background services (heartbeat / commitments / awareness) to
+   * spin up. Until those services can construct in-process at setup
+   * completion, the dashboard renders a "Restart Jarvis" banner when
+   * `setup_completed_at > daemon_started_at`. (See also issue F2.)
+   */
+  daemonStartedAt: number;
   healthMonitor: HealthMonitor;
   agentService: AgentService;
   config: JarvisConfig;
@@ -124,15 +138,26 @@ export type ApiContext = {
   emergencyController?: EmergencyController;
   deferredExecutor?: DeferredExecutor;
   awarenessService?: AwarenessService | null;
-  workflowEngine?: import('../workflows/engine.ts').WorkflowEngine;
-  triggerManager?: import('../workflows/triggers/manager.ts').TriggerManager;
-  webhookManager?: import('../workflows/triggers/webhook.ts').WebhookManager;
-  nodeRegistry?: import('../workflows/nodes/registry.ts').NodeRegistry;
-  nlBuilder?: import('../workflows/nl-builder.ts').NLWorkflowBuilder;
-  autoSuggest?: import('../workflows/auto-suggest.ts').WorkflowAutoSuggest;
+  // (legacy workflow engine fields removed; the new runtime is wired
+  //  outside this ApiContext via createWorkflowRoutes in daemon/index.ts)
   goalService?: import('../goals/service.ts').GoalService;
   sidecarManager?: import('../sidecar/manager.ts').SidecarManager;
   siteBuilderService?: import('../sites/service.ts').SiteBuilderService;
+  /**
+   * Bring the LLM-dependent post-setup services (background agent,
+   * commitment executor, awareness) online in-process. Wired by the
+   * daemon at boot. Called by `/api/onboarding/setup` so the user does
+   * not have to restart the daemon at the end of onboarding — critical
+   * for Docker / VPS deploys where a process restart is disruptive.
+   * Idempotent: a no-op if the services are already running.
+   */
+  startPostSetupServices?: () => Promise<void>;
+  /**
+   * Reports whether the post-setup services have come online. Used by
+   * the onboarding status endpoint so the dashboard knows whether to
+   * show the "Restart Jarvis" fallback banner.
+   */
+  isPostSetupServicesReady?: () => boolean;
 };
 
 // CORS headers — scoped to the dashboard origin, not wildcard
@@ -159,6 +184,11 @@ function error(message: string, status = 400): Response {
   return json({ error: message }, status);
 }
 
+function errorFromException(err: unknown): Response {
+  if (err instanceof HttpError) return error(err.message, err.status);
+  return error(err instanceof Error ? err.message : String(err), 500);
+}
+
 function getSearchParams(req: Request): URLSearchParams {
   return new URL(req.url).searchParams;
 }
@@ -170,7 +200,43 @@ type AgentTaskSnapshot = {
   task: string;
   startedAt: number;
   completedAt?: number | null;
+  result?: {
+    success: boolean;
+    response: string;
+    toolsUsed: string[];
+    terminationReason: string;
+  } | null;
 };
+
+/** List payloads cap the response so the 5s roster poll never ships a
+ *  full research report per agent; /api/agents/tasks/:id returns it
+ *  whole and the UI fetches that on expand when `response_truncated`. */
+const LIST_RESPONSE_MAX_CHARS = 2000;
+
+/** Serialize a task (with its result, when finished) for API responses.
+ *  The result is the ONLY place the sub-agent's final answer lives for
+ *  dashboard-spawned tasks -- without it the UI could show that a task
+ *  completed but never what it produced. */
+function taskToJSON(task: AgentTaskSnapshot, opts: { full?: boolean } = {}) {
+  const response = task.result?.response ?? '';
+  const truncate = !opts.full && response.length > LIST_RESPONSE_MAX_CHARS;
+  return {
+    id: task.id,
+    status: task.status,
+    task: task.task,
+    started_at: task.startedAt,
+    completed_at: task.completedAt ?? null,
+    result: task.result
+      ? {
+          success: task.result.success,
+          response: truncate ? response.slice(0, LIST_RESPONSE_MAX_CHARS) : response,
+          response_truncated: truncate,
+          tools_used: task.result.toolsUsed,
+          termination_reason: task.result.terminationReason,
+        }
+      : null,
+  };
+}
 
 function buildAgentSnapshots(ctx: ApiContext) {
   const orchestrator = ctx.agentService.getOrchestrator();
@@ -195,17 +261,10 @@ function buildAgentSnapshots(ctx: ApiContext) {
   const agents = orchestrator.getAllAgents().map((agent) => {
     const base = agent.toJSON();
     const latestTask = latestTaskByAgent.get(agent.id);
-    const busy = busyAgents.has(agent.id) || base.status === 'active' || Boolean(base.current_task);
     return {
       ...base,
-      busy,
-      latest_task: latestTask ? {
-        id: latestTask.id,
-        status: latestTask.status,
-        task: latestTask.task,
-        started_at: latestTask.startedAt,
-        completed_at: latestTask.completedAt,
-      } : null,
+      busy: busyAgents.has(agent.id),
+      latest_task: latestTask ? taskToJSON(latestTask) : null,
     };
   });
 
@@ -236,6 +295,26 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (type) query.type = type;
         if (q) query.nameContains = q;
         return json(findEntities(query));
+      },
+      // Phase 6.5 — write surface for the Memory Room. Routes through
+      // createEntity directly; the LLM-driven extractor pipeline keeps
+      // its own internal call site for auto-extraction, this is for
+      // explicit user-driven adds (UI button or voice "remember that").
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as {
+            name?: string;
+            type?: EntityType;
+            properties?: Record<string, unknown>;
+            source?: string;
+          };
+          if (!body.name || typeof body.name !== 'string') return error('name is required', 400);
+          if (!body.type || !VALID_ENTITY_TYPES.has(body.type)) {
+            return error(`type must be one of: ${Array.from(VALID_ENTITY_TYPES).join(', ')}`, 400);
+          }
+          const entity = createEntity(body.type, body.name, body.properties, body.source ?? 'dashboard');
+          return json(entity);
+        } catch (err) { return errorFromException(err); }
       },
     },
 
@@ -272,6 +351,27 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (object) query.object = object;
         return json(findFacts(query));
       },
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as {
+            subject_id?: string;
+            predicate?: string;
+            object?: string;
+            confidence?: number;
+            source?: string;
+          };
+          if (!body.subject_id || !body.predicate || !body.object) {
+            return error('subject_id, predicate, and object are required', 400);
+          }
+          const subject = getEntity(body.subject_id);
+          if (!subject) return error(`Unknown subject_id: ${body.subject_id}`, 404);
+          const fact = createFact(body.subject_id, body.predicate, body.object, {
+            confidence: body.confidence,
+            source: body.source ?? 'dashboard',
+          });
+          return json(fact);
+        } catch (err) { return errorFromException(err); }
+      },
     },
 
     // --- Vault: Relationships ---
@@ -286,6 +386,25 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (toId) query.to_id = toId;
         if (type) query.type = type;
         return json(findRelationships(query));
+      },
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as {
+            from_id?: string;
+            to_id?: string;
+            type?: string;
+            properties?: Record<string, unknown>;
+          };
+          if (!body.from_id || !body.to_id || !body.type) {
+            return error('from_id, to_id, and type are required', 400);
+          }
+          const from = getEntity(body.from_id);
+          const to = getEntity(body.to_id);
+          if (!from) return error(`Unknown from_id: ${body.from_id}`, 404);
+          if (!to) return error(`Unknown to_id: ${body.to_id}`, 404);
+          const rel = createRelationship(body.from_id, body.to_id, body.type, body.properties);
+          return json(rel);
+        } catch (err) { return errorFromException(err); }
       },
     },
 
@@ -507,7 +626,13 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         const params = getSearchParams(req);
         const type = params.get('type') as ObservationType | undefined;
         const limit = parseInt(params.get('limit') ?? '50') || 50;
-        return json(getRecentObservations(type, limit));
+        const summarized = params.get('summarized') === 'true';
+        const obs = getRecentObservations(type, limit);
+        if (!summarized) return json(obs);
+        // Phase 5B: when ?summarized=true, project each row into the
+        // stable {title, summary, type, created_at} shape the dashboard
+        // can render uniformly across all observation types.
+        return json(obs.map((o) => ({ ...summarizeObservation(o), data: o.data })));
       },
     },
 
@@ -612,6 +737,27 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             llmManager: ctx.agentService.getLLMManager(),
             specialists: ctx.agentService.getSpecialists(),
             taskManager,
+            // Dashboard-spawned tasks used to run with NO progress callback:
+            // nothing streamed to the live ticker, nothing persisted to the
+            // activity timeline, and the user never learned the task had
+            // finished (let alone what it produced). Mirror the wiring the
+            // PA's manage_agents tool gets at boot.
+            onProgress: (event: { type: 'text' | 'tool_call' | 'done'; agentName: string; agentId: string; data: unknown }) => {
+              ctx.wsService?.broadcastSubAgentProgress(event);
+            },
+            // The completion notification hangs off onTaskComplete, NOT the
+            // 'done' progress event: 'done' only fires on the success path
+            // inside runSubAgent, so a failed task would never notify at
+            // all -- and it carries no success flag to word the message by.
+            onTaskComplete: (task: AsyncTask) => {
+              const ok = task.result?.success ?? false;
+              ctx.wsService?.broadcastNotification(
+                ok
+                  ? `**${task.agentName} finished its task.** Open the Agents room to read the result.`
+                  : `**${task.agentName} could not complete its task.** Open the Agents room for details.`,
+                'normal',
+              );
+            },
           };
 
           const spawned = spawnPersistentAgent(deps, body.specialist ?? '');
@@ -626,24 +772,15 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           }
 
           const latestTask = taskManager.getAgentTask(spawned.agent.id);
-          const busy = taskManager.isAgentBusy(spawned.agent.id)
-            || spawned.agent.status === 'active'
-            || Boolean(spawned.agent.agent.current_task);
           return json({
             ...spawned.agent.toJSON(),
-            busy,
-            latest_task: latestTask ? {
-              id: latestTask.id,
-              status: latestTask.status,
-              task: latestTask.task,
-              started_at: latestTask.startedAt,
-              completed_at: latestTask.completedAt,
-            } : null,
+            busy: taskManager.isAgentBusy(spawned.agent.id),
+            latest_task: latestTask ? taskToJSON(latestTask) : null,
             spawned: spawned.summary,
             assignment,
           }, 201);
         } catch (err) {
-          return error(err instanceof Error ? err.message : String(err));
+          return errorFromException(err);
         }
       },
     },
@@ -661,6 +798,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    // Bun.serve matches literal paths (e.g. /api/agents/specialists) before patterns, so order is irrelevant.
     '/api/agents/:id': {
       DELETE: (req: Request & { params: { id: string } }) => {
         try {
@@ -674,7 +812,27 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           };
           return json(terminatePersistentAgent(deps, req.params.id));
         } catch (err) {
-          return error(err instanceof Error ? err.message : String(err));
+          return errorFromException(err);
+        }
+      },
+    },
+
+    // Phase 6.3 — per-agent activity history. Persisted snapshot of
+    // sub-agent events so the Agents Room shows a meaningful timeline on
+    // dashboard load (not just whatever streamed since the WS opened).
+    '/api/agents/:id/activity': {
+      GET: (req: Request & { params: { id: string } }) => {
+        try {
+          const url = new URL(req.url);
+          const limitParam = parseInt(url.searchParams.get('limit') ?? '', 10);
+          const offsetParam = parseInt(url.searchParams.get('offset') ?? '', 10);
+          const limit = Number.isFinite(limitParam) ? limitParam : 50;
+          const offset = Number.isFinite(offsetParam) ? offsetParam : 0;
+          const events = listAgentActivity(req.params.id, { limit, offset });
+          const total = countAgentActivity(req.params.id);
+          return json({ events, total });
+        } catch (err) {
+          return errorFromException(err);
         }
       },
     },
@@ -711,6 +869,49 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           specialists: ctx.agentService.getSpecialists(),
           taskManager: tm,
         }));
+      },
+    },
+
+    // Full detail for a single async task. Returns the response whole (the
+    // agents room fetches it on expand when `response_truncated` is set) and
+    // also flattens the fields the sub-pebble's "open full" panel
+    // (taskResult room) renders directly.
+    '/api/agents/tasks/:id': {
+      GET: (req: Request & { params: { id: string } }) => {
+        const tm = ctx.agentService.getTaskManager();
+        if (!tm) return error('Persistent agents are not available.', 503);
+        const task = tm.getTask(req.params.id);
+        if (!task) return error(`Task "${req.params.id}" not found.`, 404);
+        const elapsedS = Math.round(((task.completedAt ?? Date.now()) - task.startedAt) / 1000);
+        return json({
+          ...taskToJSON(task, { full: true }),
+          agent_id: task.agentId,
+          agent_name: task.agentName,
+          specialist_id: task.specialistId,
+          // Flat fields consumed by the taskResult room panel.
+          specialist: task.specialistId,
+          elapsed_seconds: elapsedS,
+          response: task.result?.response ?? '',
+          summary: task.summary,
+          tools_used: task.result?.toolsUsed ?? [],
+          tokens_used: task.result?.tokensUsed ?? null,
+        });
+      },
+    },
+
+    // Pebble long-answer panel — when a JARVIS response overflows the
+    // speaking bubble, the daemon registers it in the answer store and
+    // the sidecar shows an "open full ↗" button. Click spawns a panel
+    // at `#/_answer_<id>` which fetches from this endpoint.
+    '/api/pebble/answers/:id': {
+      GET: async (req: Request) => {
+        const { pebbleAnswerStore } = await import('./answer-store.ts');
+        const url = new URL(req.url);
+        const id = decodeURIComponent(url.pathname.split('/').pop() ?? '');
+        if (!id) return error('Missing answer id', 400);
+        const record = pebbleAnswerStore.get(id);
+        if (!record) return error(`Answer ${id} not found`, 404);
+        return json(record);
       },
     },
 
@@ -756,24 +957,441 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    // ── Onboarding ──────────────────────────────────────────────────
+    // Status + reset endpoints powering the v2 onboarding gate. See
+    // `docs/ONBOARDING_PLAN.md`. Reset is intentionally available on
+    // demand (not behind a build flag) so users can replay the tour
+    // after a Jarvis update or when swapping LLM providers.
+
+    '/api/onboarding/status': {
+      GET: async () => {
+        try {
+          const { loadConfig } = await import('../config/loader.ts');
+          const cfg = await loadConfig();
+          const o = cfg.onboarding;
+          // `getUserProfile` and `hasUserProfile` are already imported
+          // at the top of the file. Use `hasUserProfile()` so the
+          // check counts wizard answers AND Phase B interview facts —
+          // otherwise a user who completed the conversational
+          // interview (but never used the wizard) gets reported as
+          // "not yet onboarded" and the gate loops them back into
+          // the interview.
+          const profile = getUserProfile();
+          const profileCompleted =
+            !!o?.setup_skipped_profile || hasUserProfile(profile);
+          return json({
+            setup_completed: o?.setup_completed_at != null,
+            setup_completed_at: o?.setup_completed_at ?? null,
+            setup_skipped_profile: !!o?.setup_skipped_profile,
+            profile_completed: profileCompleted,
+            tutorial_completed: o?.tutorial_completed_at != null,
+            tutorial_completed_at: o?.tutorial_completed_at ?? null,
+            tutorial_dismissed: o?.tutorial_dismissed_at != null,
+            tutorial_progress_step: o?.tutorial_progress_step ?? null,
+            last_reset_at: o?.last_reset_at ?? null,
+            // Boot timestamp + post-setup readiness let the dashboard
+            // detect whether the background services (bgAgent, commitment
+            // executor, awareness) are actually running. With in-process
+            // construction at `/api/onboarding/setup`, no restart is
+            // needed in the normal flow; the banner only shows if that
+            // construction step failed.
+            daemon_started_at: ctx.daemonStartedAt,
+            post_setup_services_ready: ctx.isPostSetupServicesReady?.() ?? false,
+          });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    '/api/onboarding/reset': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json().catch(() => ({}))) as {
+            scope?: 'all' | 'setup' | 'profile' | 'tutorial';
+          };
+          const scope = body?.scope ?? 'all';
+          if (!['all', 'setup', 'profile', 'tutorial'].includes(scope)) {
+            return error(`Invalid scope "${scope}".`, 400);
+          }
+
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          const o = fresh.onboarding ?? {
+            setup_completed_at: null,
+            tutorial_completed_at: null,
+          };
+
+          const cleared: string[] = [];
+          if (scope === 'all' || scope === 'setup') {
+            o.setup_completed_at = null;
+            cleared.push('setup');
+          }
+          if (scope === 'all' || scope === 'profile') {
+            o.setup_skipped_profile = false;
+            clearUserProfile();
+            cleared.push('profile');
+          }
+          if (scope === 'all' || scope === 'tutorial') {
+            o.tutorial_completed_at = null;
+            o.tutorial_dismissed_at = null;
+            o.tutorial_progress_step = undefined;
+            cleared.push('tutorial');
+          }
+          o.last_reset_at = Date.now();
+          fresh.onboarding = o;
+          await saveConfig(fresh);
+
+          // Mirror to in-memory config so the next /status read is
+          // immediately consistent (don't wait for daemon restart).
+          ctx.config.onboarding = o;
+
+          // localStorage keys the client should also clear after this
+          // call. Returned in the response so the UI handler doesn't
+          // have to know about cache layers it didn't write.
+          const clientCacheKeys = ['jarvis:notif-read', 'jarvis:palette-recent'];
+          if (scope === 'all') {
+            clientCacheKeys.push('jarvis:v2:workspaces-ui');
+            clientCacheKeys.push('jarvis:room-layout');
+          }
+
+          return json({
+            ok: true,
+            scope,
+            cleared,
+            client_cache_keys: clientCacheKeys,
+            message: `Onboarding reset (${cleared.join(', ')}).`,
+          });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    /**
+     * Skip the ENTIRE onboarding flow from the first setup screen. No LLM
+     * is configured, so the daemon stays chat-less until the user wires a
+     * provider up in Settings → LLM — but the dashboard becomes reachable
+     * immediately. Marks setup complete, opts out of the profile
+     * interview, and dismisses the tutorial in one write. Existing
+     * timestamps are preserved so a skip after a partial run never
+     * regresses state.
+     */
+    '/api/onboarding/skip': {
+      POST: async () => {
+        try {
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          const now = Date.now();
+          fresh.onboarding = {
+            ...fresh.onboarding,
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? now,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            tutorial_dismissed_at: fresh.onboarding?.tutorial_dismissed_at ?? now,
+            setup_skipped_profile: true,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+
+          // Best-effort service start so the "Restart Jarvis" banner
+          // doesn't nag after a skip. Failure is non-fatal — services
+          // that need an LLM just stay idle until one is configured.
+          let postSetupStarted = false;
+          if (ctx.startPostSetupServices) {
+            try {
+              await ctx.startPostSetupServices();
+              postSetupStarted = true;
+            } catch (err) {
+              console.warn(
+                '[Onboarding] Post-setup services skipped after onboarding skip:',
+                err instanceof Error ? err.message : err,
+              );
+            }
+          }
+
+          return json({
+            ok: true,
+            setup_completed_at: fresh.onboarding.setup_completed_at,
+            post_setup_services_started: postSetupStarted,
+            message: 'Onboarding skipped. Configure an LLM in Settings to start chatting.',
+          });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    /**
+     * Phase B — user skipped the conversational profile interview.
+     * Sets `setup_skipped_profile: true` so the gate stops re-rendering
+     * Phase B. Profile remains empty; user can fill it later via the
+     * Settings → Profile wizard or by saying "redo the profile interview".
+     */
+    '/api/onboarding/profile/skip': {
+      POST: async () => {
+        try {
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          fresh.onboarding = {
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? null,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            ...fresh.onboarding,
+            setup_skipped_profile: true,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+          return json({ ok: true, setup_skipped_profile: true });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    // ── Phase C — tutorial completion endpoints ─────────────────────
+    // Three small endpoints powering the spotlight walkthrough's
+    // persistence: complete (user finished), dismiss (user skipped),
+    // progress (resume-from-step support). All three write through
+    // the same loadConfig → mutate → saveConfig pattern as the rest
+    // of the onboarding routes; the existing reset endpoint with
+    // `scope: "tutorial"` already clears all three fields.
+
+    '/api/onboarding/tutorial/complete': {
+      POST: async () => {
+        try {
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          const now = Date.now();
+          fresh.onboarding = {
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? null,
+            ...fresh.onboarding,
+            tutorial_completed_at: now,
+            tutorial_progress_step: undefined,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+          return json({ ok: true, tutorial_completed_at: now });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    '/api/onboarding/tutorial/dismiss': {
+      POST: async () => {
+        try {
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          const now = Date.now();
+          fresh.onboarding = {
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? null,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            ...fresh.onboarding,
+            tutorial_dismissed_at: now,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+          return json({ ok: true, tutorial_dismissed_at: now });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    '/api/onboarding/tutorial/progress': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json().catch(() => ({}))) as { stepId?: string };
+          const stepId = typeof body.stepId === 'string' ? body.stepId.trim() : '';
+          if (!stepId) return error('Missing stepId.', 400);
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          fresh.onboarding = {
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? null,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            ...fresh.onboarding,
+            tutorial_progress_step: stepId,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+          return json({ ok: true, tutorial_progress_step: stepId });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    /**
+     * Phase C — tutorial narration TTS broadcast. Speaks `text`
+     * through the existing TTS provider so the AppShell's `useVoice`
+     * picks it up via the regular `tts_start` + binary chunks path.
+     * The orb pulses speaking; the tutorial bubble mirrors it.
+     * Synchronous-ish: returns when synthesis completes (so the UI
+     * can advance to listening for the next "next" command).
+     */
+    '/api/onboarding/tutorial/speak': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json().catch(() => ({}))) as { text?: string };
+          const text = typeof body.text === 'string' ? body.text.trim() : '';
+          if (!text) return error('Missing text.', 400);
+          if (!ctx.wsService) return error('WS service unavailable.', 503);
+          // Reuse the proactive TTS broadcast — it already wraps with
+          // tts_start (with containsWake flag), streams binary chunks,
+          // and emits tts_end. No new transport.
+          await ctx.wsService.broadcastProactiveVoice(text);
+          return json({ ok: true });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    /**
+     * Atomic Phase A setup endpoint. Saves LLM + STT + TTS config + flips
+     * the `onboarding.setup_completed_at` flag in one shot, then hot-
+     * reloads the LLM providers and TTS provider so the next chat
+     * message goes through real services without a daemon restart.
+     *
+     * Body shape:
+     *   {
+     *     llm: {
+     *       primary: "anthropic" | "openai" | ... ,
+     *       <provider>: { api_key?: string, model?: string, base_url?: string }
+     *     },
+     *     stt: {
+     *       provider: "openai" | "groq" | "local" | "sarvam",
+     *       openai?:  { api_key?: string, model?: string },
+     *       groq?:    { api_key?: string, model?: string },
+     *       sarvam?:  { api_key?: string, model?: string, language?: string },
+     *       local?:   { endpoint: string, model?: string,
+     *                   server_type?: "whisper_cpp" | "openai_compatible" },
+     *     },
+     *     tts: {
+     *       enabled: boolean,
+     *       provider?: "edge" | "elevenlabs" | "sarvam",
+     *       voice?: string,
+     *       rate?: string,
+     *       elevenlabs?: { api_key?: string, voice_id?: string, model?: string },
+     *     }
+     *   }
+     *
+     * Each field is optional; missing means "use current/default". The TTS
+     * block is required to be present (even if just `{enabled:false}`) so
+     * the user explicitly chose during the setup screen; STT is fully
+     * optional (omit when the user picks "skip"). Sub-blocks are merged
+     * via the shared mergeSTTConfig/mergeTTSConfig helpers so existing
+     * api_keys are preserved when the patch omits them.
+     */
+    '/api/onboarding/setup': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json()) as {
+            llm?: Record<string, unknown>;
+            stt?: Record<string, unknown>;
+            tts?: Record<string, unknown>;
+          };
+
+          // 1. LLM settings — same path as /api/config/llm POST.
+          if (body.llm && Object.keys(body.llm).length > 0) {
+            const { saveLLMSettings, hotReloadLLMProviders } = await import('./llm-settings.ts');
+            saveLLMSettings(ctx.config, body.llm as any);
+            hotReloadLLMProviders(ctx.config, ctx.agentService.getLLMManager());
+          }
+
+          // 2. STT + TTS + the setup-completed flag in ONE config write.
+          //    These used to be three sequential load→save round-trips; a
+          //    daemon kill (or crash) between them persisted setup HALF-done
+          //    — TTS saved but the completion flag lost — and the user was
+          //    funneled back into onboarding on the next boot.
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const { mergeSTTConfig, mergeTTSConfig } = await import('./config-merge.ts');
+          const fresh = await loadConfig();
+          if (body.stt) {
+            // Mirrors /api/config/stt POST semantics. STT is consumed at
+            // the next transcription request, so no hot-swap is needed.
+            fresh.stt = mergeSTTConfig(fresh.stt, body.stt);
+          }
+          if (body.tts) {
+            fresh.tts = mergeTTSConfig(fresh.tts, body.tts);
+          }
+          const now = Date.now();
+          fresh.onboarding = {
+            setup_completed_at: now,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            setup_skipped_profile: fresh.onboarding?.setup_skipped_profile,
+            tutorial_dismissed_at: fresh.onboarding?.tutorial_dismissed_at,
+            tutorial_progress_step: fresh.onboarding?.tutorial_progress_step,
+            last_reset_at: fresh.onboarding?.last_reset_at,
+          };
+          await saveConfig(fresh);
+          if (body.stt) ctx.config.stt = fresh.stt;
+          if (body.tts) ctx.config.tts = fresh.tts;
+          ctx.config.onboarding = fresh.onboarding;
+
+          // 3. Hot-reload the TTS provider when possible so the post-setup
+          //    "Welcome to Jarvis" reply is spoken immediately.
+          if (body.tts) {
+            try {
+              if (ctx.config.tts && ctx.wsService) {
+                const { createTTSProvider } = await import('../comms/voice.ts');
+                const provider = await createTTSProvider(ctx.config.tts);
+                if (provider) ctx.wsService.setTTSProvider(provider);
+              }
+            } catch (err) {
+              console.warn('[Onboarding] TTS hot-reload skipped:', err);
+            }
+          }
+
+          // 4. Bring the LLM-dependent services (bgAgent, commitment
+          //    executor, awareness) online in-process. Without this the
+          //    user would have to restart the daemon — fatal UX on
+          //    Docker / VPS. Failure here is non-fatal: chat still works
+          //    via the hot-reloaded LLM, just without background features
+          //    until the next daemon restart.
+          let postSetupStarted = false;
+          if (ctx.startPostSetupServices) {
+            try {
+              await ctx.startPostSetupServices();
+              postSetupStarted = true;
+            } catch (err) {
+              console.error(
+                '[Onboarding] Failed to start post-setup services in-process:',
+                err instanceof Error ? err.message : err,
+              );
+            }
+          }
+
+          return json({
+            ok: true,
+            setup_completed_at: now,
+            post_setup_services_started: postSetupStarted,
+            message: 'Setup complete. Jarvis is ready.',
+          });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
     // --- Config (sanitized — no API keys) ---
     '/api/config': {
       GET: () => {
         const config = ctx.config;
         return json({
           daemon: config.daemon,
+          // LLM config is DB/keychain-managed (dashboard). Report a sanitized
+          // canonical summary - provider names, single-LLM default, and the
+          // tier map. The dedicated dashboard endpoint is /api/config/llm.
           llm: {
-            primary: config.llm.primary,
-            fallback: config.llm.fallback,
-            anthropic: config.llm.anthropic ? { model: config.llm.anthropic.model } : null,
-            openai: config.llm.openai ? { model: config.llm.openai.model } : null,
-            groq: config.llm.groq ? { model: config.llm.groq.model } : null,
-            ollama: config.llm.ollama ?? null,
+            providers: Object.keys(config.llm.providers ?? {}),
+            default: config.llm.default ?? null,
+            tiers: config.llm.tiers ?? {},
           },
           personality: config.personality,
           authority: config.authority,
           heartbeat: config.heartbeat,
           active_role: config.active_role,
+          voice: config.voice ?? { wake_engine: 'openwakeword' },
         });
       },
     },
@@ -846,6 +1464,126 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         } catch (err) {
           return error('Invalid request body');
         }
+      },
+    },
+
+    // Live model catalog for NVIDIA. NVIDIA's `/v1/models` is publicly
+    // readable, so this works during onboarding before any key is stored.
+    // We pass the user's key through when available so the call still
+    // authenticates if NVIDIA ever requires it. Mixes chat / embedding /
+    // vision models — the UI shows them all and relies on the connection
+    // test to weed out anything that can't speak /v1/chat/completions.
+    '/api/config/llm/nvidia/models': {
+      GET: async () => {
+        try {
+          const { NVIDIAProvider } = await import('../llm/nvidia.ts');
+          // Key (if any) lives in the keychain, keyed by provider name. NVIDIA's
+          // /v1/models is publicly readable, so an empty key still works.
+          const { getSecret } = await import('../vault/keychain.ts');
+          const key = getSecret('llm.provider.nvidia.api_key') ?? '';
+          const provider = new NVIDIAProvider(key);
+          const models = await provider.listModels();
+          return json({ ok: true, models });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ ok: false, error: msg, models: [] });
+        }
+      },
+    },
+
+    // --- Usage telemetry ---
+    /**
+     * Filterable LLM usage query. All query params are optional:
+     *   from, to        unix-ms range bounds (default: last 30 days -> now)
+     *   tier            CSV: conversation,high,medium,low
+     *   model           CSV
+     *   subsystem       CSV
+     *   provider        CSV
+     *   errors_only     "true" | "false" | "" (both)
+     *   group_by        tier | model | subsystem | provider | date | none
+     *                   default: model
+     */
+    '/api/usage': {
+      GET: async (req: Request) => {
+        try {
+          const { queryUsage } = await import('../llm/usage.ts');
+          const url = new URL(req.url);
+          const get = (k: string) => url.searchParams.get(k);
+
+          const parseCsv = (v: string | null): string[] | undefined => {
+            if (!v) return undefined;
+            const list = v.split(',').map((s) => s.trim()).filter(Boolean);
+            return list.length > 0 ? list : undefined;
+          };
+          const parseInt64 = (v: string | null): number | undefined => {
+            if (!v) return undefined;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : undefined;
+          };
+          const errorsOnlyRaw = get('errors_only');
+          const errorsOnly = errorsOnlyRaw === 'true' ? true : errorsOnlyRaw === 'false' ? false : undefined;
+          const groupByRaw = get('group_by') ?? 'model';
+          const validGroups = ['tier', 'model', 'subsystem', 'provider', 'date', 'none'] as const;
+          const groupBy = (validGroups as readonly string[]).includes(groupByRaw)
+            ? (groupByRaw as typeof validGroups[number])
+            : 'model';
+
+          const result = queryUsage(
+            {
+              fromMs: parseInt64(get('from')),
+              toMs: parseInt64(get('to')),
+              tiers: parseCsv(get('tier')),
+              models: parseCsv(get('model')),
+              subsystems: parseCsv(get('subsystem')),
+              providers: parseCsv(get('provider')),
+              errorsOnly,
+            },
+            groupBy,
+          );
+          return json(result);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ error: msg, rows: [], total: { calls: 0, input_tokens: 0, output_tokens: 0, total_latency_ms: 0, errors: 0 } });
+        }
+      },
+    },
+
+    /** Distinct filter values + date range present in the DB. Used by the
+     *  Usage room to populate filter dropdowns with only-extant choices. */
+    '/api/usage/filters': {
+      GET: async () => {
+        try {
+          const { listUsageDistinctValues } = await import('../llm/usage.ts');
+          return json(listUsageDistinctValues());
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ error: msg, tiers: [], models: [], subsystems: [], providers: [], earliest_ts: null, latest_ts: null });
+        }
+      },
+    },
+
+    /**
+     * Paused conv-tier tasks (status === 'needs_input'). Used by the dashboard
+     * to surface pending questions after a daemon restart - durability lands
+     * them back in the registry on boot, this endpoint makes them visible to
+     * the user. The conv LLM separately picks them up via registry context.
+     * Returns an empty list when running in classic mode (no task registry).
+     */
+    '/api/tasks/paused': {
+      GET: () => {
+        const registry = ctx.agentService.getTaskRegistry();
+        if (!registry) return json({ tasks: [] });
+        const tasks = registry.inFlight()
+          .filter((t) => t.status === 'needs_input')
+          .map((t) => ({
+            id: t.id,
+            template: t.request.template,
+            intent: t.request.intent,
+            question: t.question ?? '',
+            started_at: t.startedAt,
+            updated_at: t.updatedAt,
+          }));
+        return json({ tasks });
       },
     },
 
@@ -1028,7 +1766,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
 
           const diskPath = path.resolve(baseDir, safeName);
           // Verify resolved path stays within the content directory
-          if (!isWithinBase(diskPath, baseDir)) {
+          if (!isWithin(diskPath, path.resolve(baseDir))) {
             return error('Invalid filename', 400);
           }
 
@@ -1079,7 +1817,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         const filePath = path.resolve(baseDir, safeContentId, safeFilename);
 
         // Verify resolved path stays within the content directory
-        if (!isWithinBase(filePath, baseDir)) {
+        if (!isWithin(filePath, path.resolve(baseDir))) {
           return error('Invalid path', 400);
         }
 
@@ -1295,6 +2033,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
 
           return json({ ok: true, message: 'Channel config saved. Restart JARVIS to apply changes.' });
         } catch (err) {
+          console.error('[API] Error saving channels config:', err);
           return error('Invalid request body');
         }
       },
@@ -1307,6 +2046,8 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           provider: stt?.provider ?? 'openai',
           has_openai_key: !!stt?.openai?.api_key,
           has_groq_key: !!stt?.groq?.api_key,
+          has_sarvam_key: !!stt?.sarvam?.api_key,
+          sarvam_language: stt?.sarvam?.language ?? 'unknown',
           local_endpoint: stt?.local?.endpoint ?? null,
           local_server_type: stt?.local?.server_type ?? 'whisper_cpp',
         });
@@ -1315,12 +2056,15 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         try {
           const body = await req.json() as Record<string, unknown>;
           const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const { mergeSTTConfig } = await import('./config-merge.ts');
           const freshConfig = await loadConfig();
-          freshConfig.stt = { ...freshConfig.stt, ...body } as any;
+
+          freshConfig.stt = mergeSTTConfig(freshConfig.stt, body);
           await saveConfig(freshConfig);
           ctx.config.stt = freshConfig.stt;
           return json({ ok: true, message: 'STT config saved. Restart JARVIS to apply changes.' });
         } catch (err) {
+          console.error('[API] Error saving STT config:', err);
           return error('Invalid request body');
         }
       },
@@ -1342,30 +2086,23 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
             stability: tts.elevenlabs.stability ?? 0.5,
             similarity_boost: tts.elevenlabs.similarity_boost ?? 0.75,
           } : null,
+          sarvam: tts?.sarvam ? {
+            has_api_key: !!tts.sarvam.api_key,
+            model: tts.sarvam.model ?? 'bulbul:v3',
+            language: tts.sarvam.language ?? 'en-IN',
+            speaker: tts.sarvam.speaker ?? 'anushka',
+            sampling_rate: tts.sarvam.sampling_rate ?? 48000,
+          } : null,
         });
       },
       POST: async (req: Request) => {
         try {
           const body = await req.json() as Record<string, unknown>;
           const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const { mergeTTSConfig } = await import('./config-merge.ts');
           const freshConfig = await loadConfig();
 
-          // Deep-merge elevenlabs sub-object to preserve API key across saves
-          const incomingEl = body.elevenlabs as Record<string, unknown> | undefined;
-          const existingEl = freshConfig.tts?.elevenlabs;
-          delete body.elevenlabs;
-
-          freshConfig.tts = { ...freshConfig.tts, ...body } as any;
-
-          if (incomingEl) {
-            freshConfig.tts!.elevenlabs = {
-              ...existingEl,
-              ...incomingEl,
-              // Keep existing API key if new one not provided
-              api_key: (incomingEl.api_key as string) || existingEl?.api_key || '',
-            } as any;
-          }
-
+          freshConfig.tts = mergeTTSConfig(freshConfig.tts, body);
           await saveConfig(freshConfig);
           ctx.config.tts = freshConfig.tts;
 
@@ -1380,6 +2117,66 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
 
           return json({ ok: true, message: 'TTS config saved.' });
         } catch (err) {
+          console.error('[API] Error saving TTS config:', err);
+          return error('Invalid request body');
+        }
+      },
+    },
+
+    // --- Voice (wake engine + premium realtime gpt-realtime-2) ---
+    '/api/config/voice': {
+      GET: () => {
+        const voice = ctx.config.voice;
+        const rt = voice?.realtime;
+        // Surface whether realtime would actually resolve (BYO key cascade),
+        // so the UI can show "active / no key" without exposing secrets.
+        let available = false;
+        try {
+          available = resolveRealtimeVoice(ctx.config).ok;
+        } catch { available = false; }
+        return json({
+          wake_engine: voice?.wake_engine ?? 'openwakeword',
+          realtime: {
+            enabled: rt?.enabled ?? false,
+            model: rt?.model ?? 'gpt-realtime-2',
+            voice: rt?.voice ?? null,
+            reasoning_effort: rt?.reasoning_effort ?? 'low',
+            max_session_minutes: rt?.max_session_minutes ?? 10,
+            monthly_budget_usd: rt?.monthly_budget_usd ?? null,
+            // Report the EFFECTIVE backstop, not the raw field. When unset the
+            // resolver applies DEFAULT_BLOCKED_CATEGORIES, so returning `[]`
+            // here would both misreport ("nothing blocked" while payments/etc.
+            // are blocked) and let a read-modify-write round-trip persist `[]`,
+            // silently disabling the safe default. `default` flags which case
+            // it is so a client can tell "using the default" from an explicit set.
+            blocked_categories: rt?.blocked_categories ?? DEFAULT_BLOCKED_CATEGORIES,
+            blocked_categories_default: rt?.blocked_categories === undefined,
+            // true when enabled AND an OpenAI provider key resolves (via
+            // llm.providers or env) - reflects whether realtime would actually
+            // start if voice_start arrived right now.
+            available,
+          },
+        });
+      },
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as Record<string, unknown>;
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const { mergeVoiceConfig, validateVoicePatch } = await import('./config-merge.ts');
+
+          const validation = validateVoicePatch(body);
+          if (!validation.ok) return error(validation.error, 400);
+
+          const freshConfig = await loadConfig();
+          freshConfig.voice = mergeVoiceConfig(freshConfig.voice, validation.patch);
+          await saveConfig(freshConfig);
+          // Update in-memory config so the next voice_start resolves with the
+          // new settings — resolveRealtimeVoice reads ctx.config live, so no
+          // provider hot-reload is needed (unlike TTS/LLM).
+          ctx.config.voice = freshConfig.voice;
+          return json({ ok: true, message: 'Voice config saved.' });
+        } catch (err) {
+          console.error('[API] Error saving voice config:', err);
           return error('Invalid request body');
         }
       },
@@ -1439,15 +2236,34 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (!ctx.approvalManager) return json([]);
         const params = getSearchParams(req);
         const status = params.get('status');
-        if (status === 'pending') {
-          return json(ctx.approvalManager.getPending());
-        }
-        return json(ctx.approvalManager.getHistory({
-          limit: parseInt(params.get('limit') ?? '50') || 50,
-          action: (params.get('action') as ActionCategory) || undefined,
-          agentId: params.get('agent_id') || undefined,
-          status: (params.get('status') as any) || undefined,
+        const rows =
+          status === 'pending'
+            ? ctx.approvalManager.getPending()
+            : ctx.approvalManager.getHistory({
+                limit: parseInt(params.get('limit') ?? '50') || 50,
+                action: (params.get('action') as ActionCategory) || undefined,
+                agentId: params.get('agent_id') || undefined,
+                status: (params.get('status') as any) || undefined,
+              });
+
+        // Phase 5B audit fix: enrich the REST response with the same
+        // `intent` + `impact` fields the WS broadcasts already carry, so
+        // dashboard rehydration on reconnect doesn't have to derive them
+        // client-side from `tool_name` + `action_category`.
+        const { impactFromCategory } = require('../roles/authority.ts');
+        const wsService = ctx.wsService as
+          | { computeApprovalIntent?: (r: typeof rows[number]) => string }
+          | undefined;
+
+        const enriched = rows.map((r) => ({
+          ...r,
+          impact: impactFromCategory(r.action_category as ActionCategory),
+          intent:
+            wsService?.computeApprovalIntent?.(r) ??
+            (r.reason && r.reason.trim() ? r.reason : r.tool_name),
         }));
+
+        return json(enriched);
       },
     },
 
@@ -1460,10 +2276,19 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         const approved = ctx.approvalManager.approve(requestId, 'dashboard');
         if (!approved) return error('Request not found or already decided', 404);
 
-        // Execute the approved tool
-        const result = await ctx.deferredExecutor.executeApproved(requestId);
+        // Intent-declaration approvals have no deferred tool to execute —
+        // the originating `request_approval` tool call is blocked waiting for
+        // the DB status to flip (via waitForResolution polling). Skipping
+        // executeApproved avoids a recursive call into the tool registry.
+        // Inline-mode requests are likewise executed by the authority gate
+        // that is blocked on this status flip, so the result flows back to
+        // the conversation — executing here would run the tool twice.
+        let result = '';
+        if (approved.tool_name !== 'request_approval' && approved.execution_mode !== 'inline') {
+          result = await ctx.deferredExecutor.executeApproved(requestId);
+        }
 
-        // Broadcast the update
+        // Broadcast the update (removes the card from the dashboard thread)
         const updated = ctx.approvalManager.getRequest(requestId);
         if (updated) ctx.wsService?.broadcastApprovalUpdate(updated);
 
@@ -1487,6 +2312,406 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         ctx.wsService?.broadcastApprovalUpdate(denied);
 
         return json({ ok: true });
+      },
+    },
+
+    /**
+     * Palette recent picks — daemon-side LRU surviving reload + cross-device.
+     * The UI also keeps a localStorage cache as an offline fallback.
+     */
+    '/api/palette/recent': {
+      GET: (req: Request) => {
+        const { listRecentObjects } = require('../vault/recent-objects.ts');
+        const params = getSearchParams(req);
+        const limit = Math.min(parseInt(params.get('limit') ?? '5') || 5, 50);
+        const rows = listRecentObjects(limit) as Array<{
+          object_type: string;
+          object_id: string;
+          title: string;
+          summary: string | null;
+          meta: string | null;
+          picked_at: number;
+        }>;
+        return json({
+          recent: rows.map((r) => ({
+            type: r.object_type,
+            id: r.object_id,
+            ref: r.object_id,
+            title: r.title,
+            summary: r.summary ?? undefined,
+            meta: r.meta ?? undefined,
+            pickedAt: r.picked_at,
+          })),
+        });
+      },
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json()) as {
+            type?: string;
+            id?: string;
+            title?: string;
+            summary?: string;
+            meta?: string;
+          };
+          if (!body.type || !body.id || !body.title) {
+            return error('type, id, and title are required', 400);
+          }
+          const { recordRecentObject } = require('../vault/recent-objects.ts');
+          recordRecentObject({
+            object_type: body.type,
+            object_id: body.id,
+            title: body.title,
+            summary: body.summary,
+            meta: body.meta,
+          });
+          return json({ ok: true });
+        } catch (err) {
+          return error(err instanceof Error ? err.message : 'failed', 500);
+        }
+      },
+    },
+
+    /**
+     * Tool registry exposure for the ⌘K palette and the Phase 6 Tools Room.
+     * Returns every registered tool with its category, impact classification,
+     * and parameter list. Impact is derived via the same `tool-action-map` +
+     * `impactFromCategory` chain the orchestrator uses at gate time, so the
+     * Room shows exactly the impact the user would actually face on call.
+     */
+    '/api/tools': {
+      GET: () => {
+        const orchestrator = ctx.agentService.getOrchestrator();
+        const registry = orchestrator.getToolRegistry();
+        if (!registry) return json([]);
+        const { getActionForTool } = require('../authority/tool-action-map.ts');
+        const { impactFromCategory } = require('../roles/authority.ts');
+        const tools = registry.list().map((t) => {
+          const actionCategory = getActionForTool(t.name, t.category);
+          const impact = impactFromCategory(actionCategory);
+          return {
+            name: t.name,
+            category: t.category,
+            actionCategory,
+            impact,
+            description: t.description,
+            parameters: Object.entries(t.parameters).map(([k, v]) => ({
+              name: k,
+              type: v.type,
+              description: v.description,
+              required: v.required,
+            })),
+          };
+        });
+        return json(tools);
+      },
+    },
+
+    /**
+     * W4 — palette panel picks. The dashboard's `_palette` panel-mode
+     * page POSTs here when the user picks a Room or hits Esc; the daemon
+     * forwards the call through the registered palette handler so the
+     * room-spawn / panel-close logic stays in `index.ts` where the panel
+     * tracking lives. 204 on success, 503 if no handler registered.
+     */
+    '/api/palette/pick': {
+      POST: async (req: Request) => {
+        const { getPaletteHandler } = await import('./palette-controller.ts');
+        const h = getPaletteHandler();
+        if (!h) return error('Palette handler not registered', 503);
+        const body = (await req.json().catch(() => null)) as
+          | { kind?: string; key?: string; openInRoom?: boolean }
+          | null;
+        if (!body || (body.kind !== 'room' && body.kind !== 'object') || !body.key) {
+          return error('kind ("room"|"object") and key are required', 400);
+        }
+        try {
+          await h.pick({ kind: body.kind, key: body.key, openInRoom: !!body.openInRoom });
+        } catch (err) {
+          return error(`pick failed: ${(err as Error).message}`, 500);
+        }
+        return new Response(null, { status: 204 });
+      },
+    },
+
+    '/api/palette/close': {
+      POST: async () => {
+        const { getPaletteHandler } = await import('./palette-controller.ts');
+        const h = getPaletteHandler();
+        if (!h) return error('Palette handler not registered', 503);
+        try {
+          await h.close();
+        } catch (err) {
+          return error(`close failed: ${(err as Error).message}`, 500);
+        }
+        return new Response(null, { status: 204 });
+      },
+    },
+
+    /**
+     * Unified palette search aggregator. Merges all six object types into a
+     * single `PaletteResult[]` shape that maps directly to `<InlineCard>`
+     * props on the UI side. Each type is bounded so a single overflowing
+     * type can't crowd out the others.
+     *
+     * Empty `q` returns a small "recent / popular" slice per type so the
+     * palette has something useful to show on first open.
+     *
+     * Substring matching is case-insensitive. Client-side fuzzy ranking
+     * (`fuse.js`) refines order on top of these results.
+     */
+    '/api/palette/search': {
+      GET: (req: Request) => {
+        const params = getSearchParams(req);
+        const q = (params.get('q') ?? '').trim();
+        const perType = Math.min(parseInt(params.get('per_type') ?? '6') || 6, 20);
+        const ql = q.toLowerCase();
+        const matches = (s: string | undefined | null): boolean =>
+          !ql || (typeof s === 'string' && s.toLowerCase().includes(ql));
+
+        type PaletteResult = {
+          type: 'workflow' | 'memory' | 'tool' | 'agent' | 'authority' | 'log';
+          id: string;
+          ref: string;
+          title: string;
+          summary?: string;
+          meta?: string;
+          status?: { label: string; tone: 'ok' | 'warn' | 'neutral' | 'accent' };
+        };
+
+        const results: PaletteResult[] = [];
+
+        // 1. Workflows. Pulls from the new engine-backed flow tables. The
+        // display name lives on the latest version row (published, or draft
+        // if there is no published yet), so we resolve per-flow.
+        try {
+          const flows = listFlows(undefined, { limit: 100 });
+          let added = 0;
+          for (const f of flows) {
+            if (added >= perType) break;
+            const version = f.published_version_id
+              ? getFlowVersion(f.published_version_id)
+              : getLatestDraft(f.id);
+            const title = version?.displayName ?? f.external_id;
+            if (!matches(title)) continue;
+            const metaParts: string[] = [];
+            if (version?.schemaVersion) metaParts.push(`v${version.schemaVersion}`);
+            results.push({
+              type: 'workflow',
+              id: f.id,
+              ref: f.id,
+              title,
+              meta: metaParts.length > 0 ? metaParts.join(' · ') : undefined,
+              status: f.status === 'ENABLED'
+                ? { label: 'Enabled', tone: 'ok' }
+                : { label: 'Disabled', tone: 'neutral' },
+            });
+            added++;
+          }
+        } catch (err) {
+          console.warn('[palette] workflow search failed:', err);
+        }
+
+        // 2. Memory entities (vault)
+        try {
+          const entityResults = ql
+            ? searchEntitiesByName(q).slice(0, perType * 2)
+            : findEntities({}).slice(0, perType);
+          let added = 0;
+          for (const e of entityResults) {
+            if (added >= perType) break;
+            const props = (e.properties ?? {}) as Record<string, unknown>;
+            const desc = typeof props.description === 'string' ? props.description : undefined;
+            results.push({
+              type: 'memory',
+              id: e.id,
+              ref: e.id,
+              title: e.name,
+              summary: desc,
+              meta: e.type,
+            });
+            added++;
+          }
+        } catch (err) {
+          console.warn('[palette] memory search failed:', err);
+        }
+
+        // 3. Tools (from the orchestrator registry)
+        try {
+          const orchestrator = ctx.agentService.getOrchestrator();
+          const registry = orchestrator.getToolRegistry();
+          if (registry) {
+            let added = 0;
+            for (const t of registry.list()) {
+              if (added >= perType) break;
+              if (!matches(t.name) && !matches(t.description)) continue;
+              results.push({
+                type: 'tool',
+                id: t.name,
+                ref: t.name,
+                title: t.name,
+                summary: t.description,
+                meta: t.category,
+              });
+              added++;
+            }
+          }
+        } catch (err) {
+          console.warn('[palette] tool search failed:', err);
+        }
+
+        // 4. Agents
+        try {
+          const agents = buildAgentSnapshots(ctx).agents as Array<{
+            id: string;
+            role?: { name?: string; description?: string };
+            status?: string;
+            isBusy?: boolean;
+          }>;
+          let added = 0;
+          for (const a of agents) {
+            if (added >= perType) break;
+            const name = a.role?.name ?? a.id;
+            const desc = a.role?.description;
+            if (!matches(name) && !matches(desc)) continue;
+            results.push({
+              type: 'agent',
+              id: a.id,
+              ref: a.id,
+              title: name,
+              summary: desc,
+              meta: a.status,
+              status: a.isBusy
+                ? { label: 'Busy', tone: 'warn' }
+                : { label: 'Idle', tone: 'neutral' },
+            });
+            added++;
+          }
+        } catch (err) {
+          console.warn('[palette] agent search failed:', err);
+        }
+
+        // 5. Authority — pending approvals
+        try {
+          const mgr = ctx.approvalManager;
+          if (mgr) {
+            const pending = mgr.getPending();
+            let added = 0;
+            for (const a of pending) {
+              if (added >= perType) break;
+              if (!matches(a.reason) && !matches(a.tool_name) && !matches(a.action_category)) continue;
+              results.push({
+                type: 'authority',
+                id: a.id,
+                ref: a.id,
+                title: a.reason || a.tool_name,
+                summary: `${a.tool_name} · ${a.action_category}`,
+                meta: a.urgency,
+                status: { label: 'Pending', tone: 'warn' },
+              });
+              added++;
+            }
+          }
+        } catch (err) {
+          console.warn('[palette] authority search failed:', err);
+        }
+
+        // 6. Logs (recent observations) — normalized via summarizeObservation
+        try {
+          const obs = getRecentObservations(undefined, perType * 4);
+          let added = 0;
+          for (const o of obs) {
+            if (added >= perType) break;
+            const sum = summarizeObservation(o);
+            if (!matches(sum.title) && !matches(sum.summary)) continue;
+            results.push({
+              type: 'log',
+              id: o.id,
+              ref: o.id,
+              title: sum.title,
+              summary: sum.summary || undefined,
+              meta: new Date(o.created_at).toLocaleTimeString(),
+            });
+            added++;
+          }
+        } catch (err) {
+          console.warn('[palette] log search failed:', err);
+        }
+
+        return json({ q, results });
+      },
+    },
+
+    /**
+     * Voice clarifier / repeat-back resolution.
+     * The daemon holds a pending utterance when the classifier confidence is
+     * <0.85; the dashboard renders a clarifier or repeat-back card; this
+     * endpoint resolves it. `confirm` forwards the held transcript to the
+     * chat agent; `cancel` drops the request silently (the user-voice
+     * ThreadItem stays in the thread, no assistant reply follows).
+     */
+    '/api/voice/clarifier/:id/confirm': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.wsService) return error('WS service not configured', 500);
+        const result = await ctx.wsService.resolveVoiceConfirmation(req.params.id, 'confirm');
+        if (!result.ok) return error(result.reason ?? 'resolve failed', 404);
+        return json({ ok: true });
+      },
+    },
+    '/api/voice/clarifier/:id/cancel': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.wsService) return error('WS service not configured', 500);
+        const result = await ctx.wsService.resolveVoiceConfirmation(req.params.id, 'cancel');
+        if (!result.ok) return error(result.reason ?? 'resolve failed', 404);
+        return json({ ok: true });
+      },
+    },
+    '/api/voice/repeat-back/:id/confirm': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.wsService) return error('WS service not configured', 500);
+        const result = await ctx.wsService.resolveVoiceConfirmation(req.params.id, 'confirm');
+        if (!result.ok) return error(result.reason ?? 'resolve failed', 404);
+        return json({ ok: true });
+      },
+    },
+    '/api/voice/repeat-back/:id/cancel': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.wsService) return error('WS service not configured', 500);
+        const result = await ctx.wsService.resolveVoiceConfirmation(req.params.id, 'cancel');
+        if (!result.ok) return error(result.reason ?? 'resolve failed', 404);
+        return json({ ok: true });
+      },
+    },
+
+    /**
+     * LLM-quality "Try saying" suggestions for the voice rail. Body:
+     * `{ recentTurns: [{ role: 'user'|'assistant', text: string }, ...] }`.
+     * Returns `{ suggestions: string[] }` (3–5 items, never destructive).
+     * Empty array on cold-start or any LLM failure — the client falls back
+     * to its heuristic in that case.
+     */
+    '/api/voice/suggestions': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json()) as { recentTurns?: unknown };
+          const llm = ctx.agentService.getLLMManager();
+          const turns = Array.isArray(body.recentTurns)
+            ? body.recentTurns
+                .filter(
+                  (t): t is { role: 'user' | 'assistant'; text: string } =>
+                    !!t && typeof t === 'object'
+                    && (((t as { role?: unknown }).role === 'user') || ((t as { role?: unknown }).role === 'assistant'))
+                    && typeof (t as { text?: unknown }).text === 'string',
+                )
+                .slice(-5)
+            : [];
+
+          const { generateVoiceSuggestions } = await import('../agents/voice-suggestions.ts');
+          const suggestions = await generateVoiceSuggestions(turns, llm);
+          return json({ suggestions });
+        } catch (err) {
+          console.warn('[api] voice suggestions error:', err);
+          return json({ suggestions: [] });
+        }
       },
     },
 
@@ -1586,6 +2811,66 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    /**
+     * Phase 6.6 — voice-friendly grant/revoke. Adds (or updates) a single
+     * per-action override to the authority config without exposing the
+     * full schema. Used by the Authority Room voice actions
+     * "grant_access" and "revoke_access" so the user can say
+     * "grant Jarvis email access" and have it persist.
+     *
+     * Body: { action: ActionCategory, allow: boolean, role_id?: string }
+     * Returns: { ok: true, config: AuthorityConfig }
+     *
+     * Idempotent: if a global override for the action already exists,
+     * its `allowed` flag is updated. Otherwise a new entry is appended.
+     * Role-scoped overrides (when `role_id` is provided) are matched by
+     * (action, role_id) tuple.
+     */
+    '/api/authority/config/quick-override': {
+      POST: async (req: Request) => {
+        if (!ctx.authorityEngine) return error('Authority engine not configured', 500);
+        try {
+          const body = await req.json() as { action?: ActionCategory; allow?: boolean; role_id?: string };
+          if (!body.action) return error('Missing "action" field', 400);
+          if (typeof body.allow !== 'boolean') return error('Missing "allow" boolean', 400);
+
+          const validActions: ReadonlyArray<ActionCategory> = [
+            'read_data', 'write_data', 'delete_data',
+            'send_message', 'send_email',
+            'execute_command', 'install_software',
+            'make_payment', 'modify_settings',
+            'spawn_agent', 'terminate_agent',
+            'access_browser', 'control_app',
+          ];
+          if (!validActions.includes(body.action)) {
+            return error(`Invalid action: ${body.action}`, 400);
+          }
+
+          // Single source of truth for the merge logic - shared with
+          // the unit test in quick-override.test.ts so they can't drift.
+          const currentConfig = applyQuickOverride(ctx.authorityEngine.getConfig(), {
+            action: body.action,
+            allow: body.allow,
+            role_id: body.role_id,
+          });
+          ctx.authorityEngine.updateConfig(currentConfig);
+
+          // Persist to config.yaml — same path as the full POST.
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const freshConfig = await loadConfig();
+          freshConfig.authority = {
+            ...freshConfig.authority,
+            overrides: currentConfig.overrides,
+          };
+          await saveConfig(freshConfig);
+
+          return json({ ok: true, config: currentConfig });
+        } catch (err) {
+          return error(`quick-override failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+    },
+
     '/api/authority/learning/suggestions': {
       GET: () => {
         if (!ctx.learner) return json([]);
@@ -1650,6 +2935,7 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           status: ctx.awarenessService.status(),
           enabled: ctx.awarenessService.isEnabled(),
           liveContext: ctx.awarenessService.getLiveContext(),
+          usageEstimate: ctx.awarenessService.getUsageEstimate(),
         });
       },
     },
@@ -1679,48 +2965,52 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     },
 
     '/api/awareness/captures/:id/image': {
-      GET: (req: Request & { params: { id: string } }) => {
+      GET: async (req: Request & { params: { id: string } }) => {
         const capture = getCapture(req.params.id);
         if (!capture || !capture.image_path) return error('Image not found', 404);
-        // Validate path stays within the expected captures/data directory
-        const jarvisDir = path.join(os.homedir(), '.jarvis');
-        if (!isWithinBase(capture.image_path, jarvisDir)) {
-          return error('Image not found', 404);
-        }
-        try {
-          const imageData = readFileSync(capture.image_path);
-          return new Response(imageData, {
-            headers: { ...CORS, 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=3600' },
-          });
-        } catch {
-          return error('Image file not found on disk', 404);
-        }
-      },
-    },
 
-    '/api/awareness/captures/:id/thumbnail': {
-      GET: (req: Request & { params: { id: string } }) => {
-        const capture = getCapture(req.params.id);
-        if (!capture) return error('Capture not found', 404);
-        const jarvisDir = path.join(os.homedir(), '.jarvis');
-        // Prefer thumbnail, fall back to full image
-        if (capture.thumbnail_path && isWithinBase(capture.thumbnail_path, jarvisDir)) {
-          try {
-            const thumbData = readFileSync(capture.thumbnail_path);
-            return new Response(thumbData, {
-              headers: { ...CORS, 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=3600' },
-            });
-          } catch { /* thumbnail file missing, fall through */ }
-        }
-        if (capture.image_path && isWithinBase(capture.image_path, jarvisDir)) {
+        // Legacy rows (pre-Phase-7) have null sidecar_id and an image_path that
+        // points to brain-local disk. Serve from there as a fallback.
+        if (!capture.sidecar_id) {
+          const jarvisDir = path.join(os.homedir(), '.jarvis');
+          if (!isWithin(path.resolve(capture.image_path), path.resolve(jarvisDir))) {
+            return error('Image not found', 404);
+          }
           try {
             const imageData = readFileSync(capture.image_path);
-            return new Response(imageData, {
+            return new Response(new Uint8Array(imageData), {
               headers: { ...CORS, 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=3600' },
             });
-          } catch { /* fall through */ }
+          } catch {
+            return error('Image file not found on disk', 404);
+          }
         }
-        return error('Thumbnail not found', 404);
+
+        if (!ctx.sidecarManager) return error('Sidecar manager not available', 503);
+
+        try {
+          const result = await ctx.sidecarManager.dispatchRPC(
+            capture.sidecar_id,
+            'fetch_capture',
+            { path: capture.image_path }
+          ) as (Record<string, unknown> & { _binary?: { type?: string; data?: string } | Buffer }) | undefined;
+
+          const binary = result?._binary;
+          let imageData: Buffer | null = null;
+          if (binary && typeof binary === 'object' && 'data' in binary && typeof binary.data === 'string') {
+            imageData = Buffer.from(binary.data, 'base64');
+          } else if (Buffer.isBuffer(binary)) {
+            imageData = binary;
+          }
+          if (!imageData) return error('Image data unavailable', 502);
+
+          return new Response(new Uint8Array(imageData), {
+            headers: { ...CORS, 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=3600' },
+          });
+        } catch (err) {
+          console.error('[API] /captures/:id/image fetch_capture failed:', err instanceof Error ? err.message : err);
+          return error('Image fetch failed', 502);
+        }
       },
     },
 
@@ -1823,288 +3113,6 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
-    // --- Workflows (M14) ---
-    '/api/workflows': {
-      GET: (req: Request) => {
-        try {
-          const { findWorkflows } = require('../vault/workflows.ts');
-          const params = getSearchParams(req);
-          const query: any = {};
-          if (params.has('enabled')) query.enabled = params.get('enabled') === 'true';
-          if (params.has('tag')) query.tag = params.get('tag');
-          if (params.has('limit')) query.limit = parseInt(params.get('limit')!);
-          return json(findWorkflows(query));
-        } catch (err) { return error(`${err}`); }
-      },
-      POST: async (req: Request) => {
-        try {
-          const { createWorkflow, createVersion } = require('../vault/workflows.ts');
-          const body = await req.json() as any;
-          if (!body.name) return error('name is required');
-          const wf = createWorkflow(body.name, {
-            description: body.description,
-            authority_level: body.authority_level,
-            tags: body.tags,
-          });
-          if (body.definition) {
-            createVersion(wf.id, body.definition, body.changelog ?? 'Initial version');
-          }
-          return json(wf, 201);
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/nodes': {
-      GET: () => {
-        if (!ctx.nodeRegistry) return error('Node registry not available', 503);
-        return json(ctx.nodeRegistry.list().map(n => ({
-          type: n.type, label: n.label, description: n.description,
-          category: n.category, icon: n.icon, color: n.color,
-          configSchema: n.configSchema, inputs: n.inputs, outputs: n.outputs,
-        })));
-      },
-    },
-
-    '/api/workflows/import': {
-      POST: async (req: Request) => {
-        try {
-          const { importWorkflowYaml } = require('../workflows/yaml.ts');
-          const { createWorkflow, createVersion, setVariable } = require('../vault/workflows.ts');
-          const yamlText = await req.text();
-          const imported = importWorkflowYaml(yamlText);
-          const wf = createWorkflow(imported.name, {
-            description: imported.description,
-            authority_level: imported.authority_level,
-            tags: imported.tags,
-          });
-          createVersion(wf.id, imported.definition, 'Imported');
-          for (const [k, v] of Object.entries(imported.variables)) {
-            setVariable(wf.id, k, v);
-          }
-          return json(wf, 201);
-        } catch (err) { return error(`YAML import failed: ${err}`); }
-      },
-    },
-
-    '/api/workflows/:id': {
-      GET: (req: Request) => {
-        try {
-          const { getWorkflow } = require('../vault/workflows.ts');
-          const url = new URL(req.url);
-          const id = url.pathname.split('/').pop()!;
-          const wf = getWorkflow(id);
-          if (!wf) return error('Workflow not found', 404);
-          return json(wf);
-        } catch (err) { return error(`${err}`); }
-      },
-      PATCH: async (req: Request) => {
-        try {
-          const { updateWorkflow } = require('../vault/workflows.ts');
-          const url = new URL(req.url);
-          const id = url.pathname.split('/').pop()!;
-          const body = await req.json() as any;
-          const updated = updateWorkflow(id, body);
-          if (!updated) return error('Workflow not found', 404);
-          return json(updated);
-        } catch (err) { return error(`${err}`); }
-      },
-      DELETE: (req: Request) => {
-        try {
-          const { deleteWorkflow } = require('../vault/workflows.ts');
-          const url = new URL(req.url);
-          const id = url.pathname.split('/').pop()!;
-          ctx.triggerManager?.unregisterWorkflow(id);
-          deleteWorkflow(id);
-          return json({ ok: true });
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/:id/versions': {
-      GET: (req: Request) => {
-        try {
-          const { getVersionHistory } = require('../vault/workflows.ts');
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2];
-          return json(getVersionHistory(id));
-        } catch (err) { return error(`${err}`); }
-      },
-      POST: async (req: Request) => {
-        try {
-          const { createVersion } = require('../vault/workflows.ts');
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2];
-          const body = await req.json() as any;
-          if (!body.definition) return error('definition is required');
-          const version = createVersion(id, body.definition, body.changelog);
-          return json(version, 201);
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/:id/execute': {
-      POST: async (req: Request) => {
-        if (!ctx.workflowEngine) return error('Workflow engine not available', 503);
-        try {
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2];
-          let triggerData: Record<string, unknown> = {};
-          try { triggerData = await req.json() as any; } catch {}
-          const execution = await ctx.workflowEngine.execute(id!, 'manual', triggerData);
-          return json(execution, 201);
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/:id/executions': {
-      GET: (req: Request) => {
-        try {
-          const { findExecutions } = require('../vault/workflows.ts');
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2];
-          return json(findExecutions({ workflow_id: id }));
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/:id/variables': {
-      GET: (req: Request) => {
-        try {
-          const { getVariables } = require('../vault/workflows.ts');
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2];
-          return json(getVariables(id));
-        } catch (err) { return error(`${err}`); }
-      },
-      PATCH: async (req: Request) => {
-        try {
-          const { setVariable, getVariables } = require('../vault/workflows.ts');
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2];
-          const body = await req.json() as Record<string, unknown>;
-          for (const [key, value] of Object.entries(body)) {
-            setVariable(id, key, value);
-          }
-          return json(getVariables(id));
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/:id/export': {
-      GET: (req: Request) => {
-        try {
-          const { getWorkflow, getLatestVersion, getVariables } = require('../vault/workflows.ts');
-          const { exportWorkflowYaml } = require('../workflows/yaml.ts');
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const id = parts[parts.length - 2];
-          const wf = getWorkflow(id);
-          if (!wf) return error('Workflow not found', 404);
-          const version = getLatestVersion(id);
-          if (!version) return error('No version found', 404);
-          const vars = getVariables(id);
-          const yaml = exportWorkflowYaml(wf, version, vars);
-          return new Response(yaml, {
-            headers: {
-              'Content-Type': 'text/yaml',
-              'Content-Disposition': `attachment; filename="${sanitizeFilename(wf.name)}.yaml"`,
-              ...CORS,
-            },
-          });
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/executions/:executionId': {
-      GET: (req: Request) => {
-        try {
-          const { getExecution, getStepResults } = require('../vault/workflows.ts');
-          const url = new URL(req.url);
-          const executionId = url.pathname.split('/').pop()!;
-          const exec = getExecution(executionId);
-          if (!exec) return error('Execution not found', 404);
-          const steps = getStepResults(executionId);
-          return json({ ...exec, steps });
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/executions/:executionId/cancel': {
-      POST: async (req: Request) => {
-        if (!ctx.workflowEngine) return error('Workflow engine not available', 503);
-        try {
-          const url = new URL(req.url);
-          const parts = url.pathname.split('/');
-          const executionId = parts[parts.length - 2];
-          await ctx.workflowEngine.cancel(executionId!);
-          return json({ ok: true });
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/nl-chat': {
-      POST: async (req: Request) => {
-        if (!ctx.nlBuilder) return error('NL builder not available', 503);
-        try {
-          const body = await req.json() as { workflowId: string; message: string; history?: Array<{ role: string; content: string }> };
-          const result = await ctx.nlBuilder.chat(
-            body.workflowId,
-            body.message,
-            (body.history ?? []) as Array<{ role: 'user' | 'assistant'; content: string }>,
-          );
-          return json(result);
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/suggest': {
-      GET: async () => {
-        if (!ctx.autoSuggest) return error('Auto-suggest not available', 503);
-        try {
-          const suggestions = await ctx.autoSuggest.generateSuggestions();
-          return json(suggestions);
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/workflows/suggest/:id/dismiss': {
-      POST: async (req: Request) => {
-        if (!ctx.autoSuggest) return error('Auto-suggest not available', 503);
-        try {
-          const url = new URL(req.url);
-          const id = url.pathname.split('/').pop() === 'dismiss'
-            ? url.pathname.split('/').slice(-2, -1)[0]
-            : url.pathname.split('/').pop()!;
-          ctx.autoSuggest.dismiss(id!);
-          return json({ ok: true });
-        } catch (err) { return error(`${err}`); }
-      },
-    },
-
-    '/api/webhooks/:id': {
-      POST: async (req: Request) => {
-        if (!ctx.webhookManager) return error('Webhook manager not available', 503);
-        try {
-          const url = new URL(req.url);
-          const id = url.pathname.split('/').pop()!;
-          return ctx.webhookManager.handleRequest(id, req);
-        } catch (err) { return error(`${err}`); }
-      },
-      GET: async (req: Request) => {
-        if (!ctx.webhookManager) return error('Webhook manager not available', 503);
-        try {
-          const url = new URL(req.url);
-          const id = url.pathname.split('/').pop()!;
-          return ctx.webhookManager.handleRequest(id, req);
-        } catch (err) { return error(`${err}`); }
-      },
-    },
 
     // ── Goals (M16) ─────────────────────────────────────────────────
 

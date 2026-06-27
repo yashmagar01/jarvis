@@ -6,9 +6,8 @@
     "moduleDetection": "force",
     "jsx": "react-jsx",
     "allowJs": true,
-    "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["./src/*"]
     },
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
@@ -23,5 +22,6 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "include": ["src/**/*.ts", "ui/**/*.ts", "ui/**/*.tsx"]
+  "include": ["src/**/*.ts", "ui/**/*.ts", "ui/**/*.tsx"],
+  "exclude": ["src/workflows/activepieces/**"]
 }

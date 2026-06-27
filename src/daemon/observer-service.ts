@@ -1,11 +1,16 @@
 /**
- * Observer Service — The Eyes
+ * Observer Service — account-level integrations (Gmail, Calendar).
  *
- * Wraps ObserverManager. Registers system observers (file watcher,
- * clipboard monitor, process monitor, email, calendar, notifications)
- * and routes events to the vault.
- * Also classifies events and routes them to the EventReactor (immediate)
- * or EventCoalescer (batched for heartbeat).
+ * Wraps ObserverManager and routes its events to the vault + classifier
+ * (EventReactor immediate / EventCoalescer batched) and, via the daemon's
+ * forward callback, the workflow event bus.
+ *
+ * Host-sensing observers (file watcher, clipboard, process monitor, desktop
+ * notifications) used to live here too. In the ambient/pebble model the SIDECAR
+ * is the agent that runs on the user's machine, so all machine-level
+ * observation now runs there (see StartObservers in sidecar/observers.go) and
+ * streams to the brain, which ingests it in src/daemon/index.ts. This service
+ * keeps only the account-level integrations, which are not tied to one machine.
  */
 
 import type { Service, ServiceStatus } from './services.ts';
@@ -16,22 +21,16 @@ import type { EventCoalescer } from './event-coalescer.ts';
 import type { GoogleAuth } from '../integrations/google-auth.ts';
 
 import { homedir } from 'node:os';
-import {
-  ObserverManager,
-  FileWatcher,
-  ClipboardMonitor,
-  ProcessMonitor,
-} from '../observers/index.ts';
+import { ObserverManager } from '../observers/index.ts';
 import { EmailSync } from '../observers/email.ts';
 import { CalendarSync } from '../observers/calendar.ts';
-import { NotificationListener } from '../observers/notifications.ts';
 import { createObservation } from '../vault/observations.ts';
 import { classifyEvent } from './event-classifier.ts';
 
 /**
  * Map observer event types to vault observation types.
  */
-function mapEventType(eventType: string): ObservationType {
+export function mapEventType(eventType: string): ObservationType {
   switch (eventType) {
     case 'file_change':
       return 'file_change';
@@ -68,25 +67,47 @@ export class ObserverService implements Service {
   private reactor: EventReactor | null;
   private coalescer: EventCoalescer | null;
   private googleAuth: GoogleAuth | null;
+  private dataDir: string;
+  /**
+   * Optional fan-out callback fired on every observer event AFTER the vault
+   * write and reactor/coalescer routing. Used by the workflow runtime to
+   * republish events onto its bus so `on_event` triggers can fire. Errors in
+   * the callback are caught and logged so the main pipeline never breaks.
+   */
+  private forwardCallback: ((event: ObserverEvent) => void) | null = null;
 
-  constructor(reactor?: EventReactor, coalescer?: EventCoalescer, googleAuth?: GoogleAuth) {
+  constructor(
+    reactor?: EventReactor,
+    coalescer?: EventCoalescer,
+    googleAuth?: GoogleAuth,
+    dataDir?: string,
+  ) {
     this.manager = new ObserverManager();
     this.reactor = reactor ?? null;
     this.coalescer = coalescer ?? null;
     this.googleAuth = googleAuth ?? null;
+    this.dataDir = dataDir ?? `${homedir()}/.jarvis`;
+  }
+
+  /**
+   * Register a side-channel handler called after the standard reactor /
+   * coalescer routing. Replaces any previously-set forward callback.
+   */
+  setForwardCallback(cb: (event: ObserverEvent) => void): void {
+    this.forwardCallback = cb;
   }
 
   async start(): Promise<void> {
     this._status = 'starting';
 
     try {
-      // Register core observers
-      this.manager.register(new FileWatcher([homedir()]));
-      this.manager.register(new ClipboardMonitor());
-      this.manager.register(new ProcessMonitor());
-
-      // Register D-Bus notification observer (Linux/WSL2)
-      this.manager.register(new NotificationListener());
+      // Host-sensing observers (file watcher, clipboard, process monitor,
+      // desktop notifications) now run in the sidecar (sidecar/observers.go)
+      // and stream to the brain, which ingests them in src/daemon/index.ts.
+      // This service registers only the account-level integrations below.
+      //
+      // NB: this supersedes the JARVIS_FILE_WATCH_PATHS boot-hang workaround
+      // (#246) — there is no brain-side file watcher to hang boot anymore.
 
       // Register Gmail observer (if Google auth available)
       this.manager.register(new EmailSync(this.googleAuth ?? undefined));
@@ -123,6 +144,16 @@ export class ObserverService implements Service {
           }
         } catch (err) {
           console.error('[ObserverService] Error classifying event:', err);
+        }
+
+        // 3. Forward to any side-channel consumers (workflow event bus, etc.).
+        //    Catch errors so a broken consumer doesn't take down the observer pipeline.
+        if (this.forwardCallback) {
+          try {
+            this.forwardCallback(event);
+          } catch (err) {
+            console.error('[ObserverService] forwardCallback error:', err);
+          }
         }
       });
 

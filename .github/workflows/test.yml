@@ -2,8 +2,12 @@ name: Tests
 on:
   push:
     branches: ["**"]
-    tags-ignore: ["v*"]
+    tags-ignore: ["v*", "sidecar-v*"]
   pull_request:
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.25"
 
 jobs:
   test:
@@ -14,5 +18,89 @@ jobs:
         with:
           bun-version: latest
       - run: bun install
+      - run: bun run scripts/check-no-ee-imports.ts
       - run: bun test
       - run: bunx tsc --noEmit
+
+  # ─── Sidecar compile + test gate (cgo) ─────────────────────────
+  # The sidecar is a cgo program (webview_go + GTK overlays). The local
+  # pre-commit hook does NOT run Go, so this is the only automated guard that
+  # the sidecar still builds. Linux native + Windows mingw cross-build cover the
+  # two toolchains verifiable on a Linux runner; darwin builds on release.
+  sidecar-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          # Single source of truth for the toolchain — tracks sidecar/go.mod so
+          # the build gate can't drift from the declared Go version (GO_VERSION
+          # env is now unused; left in place to avoid touching unrelated jobs).
+          go-version-file: sidecar/go.mod
+          cache-dependency-path: sidecar/go.sum
+
+      - name: Install Linux UI libraries + mingw
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev pkg-config build-essential \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+          for d in /usr/lib/*/pkgconfig; do
+            [ -f "$d/webkit2gtk-4.1.pc" ] && sudo ln -sf "$d/webkit2gtk-4.1.pc" "$d/webkit2gtk-4.0.pc" || true
+            [ -f "$d/javascriptcoregtk-4.1.pc" ] && sudo ln -sf "$d/javascriptcoregtk-4.1.pc" "$d/javascriptcoregtk-4.0.pc" || true
+          done
+
+      - name: Build + vet + test (linux/amd64, cgo)
+        working-directory: sidecar
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go build ./...
+          go test ./...
+
+      - name: Cross-build (windows/amd64, mingw)
+        working-directory: sidecar
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "1"
+          CC: x86_64-w64-mingw32-gcc
+          CXX: x86_64-w64-mingw32-g++
+        run: |
+          set -euo pipefail
+          export CGO_CFLAGS="-I$(pwd)/include" CGO_CXXFLAGS="-I$(pwd)/include"
+          go build -o /tmp/jarvis-sidecar.exe .
+
+  # NOTE: the sidecar VERSION-bump PR gate is intentionally OFF during the
+  # current development phase — the sidecar is frozen at sidecar/VERSION = 0.1.0
+  # and ships as a single version, so per-change bumps aren't wanted. Reinstate a
+  # "shipping sidecar change must bump sidecar/VERSION" job here when independent
+  # per-change versioning resumes (design in docs/PEBBLE_REVIEW... §7.4.C).
+
+  # Validate the macOS Vision OCR helper compiles, and publish the universal
+  # Mach-O binary as an artifact so operators can grab it without cutting a
+  # release tag. The artifact is attached to every run and can also be built
+  # on demand via the Actions "Run workflow" button (workflow_dispatch).
+  ocr-helper:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build universal ocr-helper
+        working-directory: sidecar
+        run: |
+          set -euo pipefail
+          swiftc -O -target arm64-apple-macos11  -o /tmp/ocr-helper-arm64 helpers/ocr-helper.swift
+          swiftc -O -target x86_64-apple-macos11 -o /tmp/ocr-helper-amd64 helpers/ocr-helper.swift
+          mkdir -p helpers
+          lipo -create -output helpers/ocr-helper /tmp/ocr-helper-arm64 /tmp/ocr-helper-amd64
+          file helpers/ocr-helper
+          lipo -info helpers/ocr-helper
+
+      - name: Upload helper binary
+        uses: actions/upload-artifact@v5
+        with:
+          name: ocr-helper-darwin
+          path: sidecar/helpers/ocr-helper

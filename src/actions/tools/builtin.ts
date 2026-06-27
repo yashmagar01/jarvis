@@ -11,10 +11,11 @@ import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { hostname, platform, arch, cpus, version } from 'node:os';
 import { TerminalExecutor } from '../terminal/executor.ts';
+import { WSLBridge } from '../terminal/wsl-bridge.ts';
 import { BrowserController, type PageSnapshot } from '../browser/session.ts';
 import type { ToolDefinition, ToolResult } from './registry.ts';
 import type { LLMTool } from '../../llm/provider.ts';
-import { routeToSidecar } from './sidecar-route.ts';
+import { routeToSidecar, autoTargetForCapability } from './sidecar-route.ts';
 import { listSidecarsTool } from './sidecar-list.ts';
 import { DESKTOP_TOOLS } from './desktop.ts';
 
@@ -85,7 +86,7 @@ export const runCommandTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability('terminal');
     if (target) {
       return routeToSidecar(target, 'run_command', {
         command: params.command,
@@ -134,7 +135,7 @@ export const readFileTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability('filesystem');
     if (target) {
       return routeToSidecar(target, 'read_file', { path: params.path }, 'filesystem');
     }
@@ -186,7 +187,7 @@ export const writeFileTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability('filesystem');
     if (target) {
       return routeToSidecar(target, 'write_file', { path: params.path, content: params.content }, 'filesystem');
     }
@@ -220,7 +221,7 @@ export const listDirectoryTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability('filesystem');
     if (target) {
       return routeToSidecar(target, 'list_directory', { path: params.path }, 'filesystem');
     }
@@ -271,6 +272,11 @@ function localClipboardRead(): string {
     return execSync('pbpaste', { encoding: 'utf-8' });
   } else if (os === 'win32') {
     return execSync('powershell -command Get-Clipboard', { encoding: 'utf-8' }).trimEnd();
+  } else if (WSLBridge.isWSL()) {
+    // On WSL the X clipboard (xclip/xsel via WSLg) is NOT the clipboard the
+    // user copies/pastes with -- that's the Windows clipboard. Read it through
+    // Windows interop so workflows see what the user actually copied.
+    return execSync('powershell.exe -NoProfile -Command Get-Clipboard', { encoding: 'utf-8' }).replace(/\r\n/g, '\n').trimEnd();
   } else {
     try {
       return execSync('xclip -selection clipboard -o', { encoding: 'utf-8' });
@@ -286,6 +292,12 @@ function localClipboardWrite(content: string): void {
     execSync('pbcopy', { input: content, encoding: 'utf-8' });
   } else if (os === 'win32') {
     execSync('powershell -command Set-Clipboard', { input: content, encoding: 'utf-8' });
+  } else if (WSLBridge.isWSL()) {
+    // Write to the Windows clipboard via interop. `clip.exe` is the simplest
+    // sink and is always present on WSL; it consumes stdin verbatim. (xclip/
+    // xsel would only populate the WSLg X clipboard, which Windows apps and
+    // the desktop sidecar's clipboard observer never see.)
+    execSync('clip.exe', { input: content, encoding: 'utf-8' });
   } else {
     try {
       execSync('xclip -selection clipboard', { input: content, encoding: 'utf-8' });
@@ -339,7 +351,8 @@ export const getClipboardTool: ToolDefinition = {
   },
   execute: async (params) => {
     const target = params.target as string | undefined;
-    if (target) return routeToSidecar(target, 'get_clipboard', {}, 'clipboard');
+    const auto = target || autoTargetForCapability('clipboard');
+    if (auto) return routeToSidecar(auto, 'get_clipboard', {}, 'clipboard');
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       const content = localClipboardRead();
@@ -368,7 +381,8 @@ export const setClipboardTool: ToolDefinition = {
   },
   execute: async (params) => {
     const target = params.target as string | undefined;
-    if (target) return routeToSidecar(target, 'set_clipboard', { content: params.content }, 'clipboard');
+    const auto = target || autoTargetForCapability('clipboard');
+    if (auto) return routeToSidecar(auto, 'set_clipboard', { content: params.content }, 'clipboard');
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       localClipboardWrite(params.content as string);
@@ -392,7 +406,8 @@ export const captureScreenTool: ToolDefinition = {
   },
   execute: async (params) => {
     const target = params.target as string | undefined;
-    if (target) return routeToSidecar(target, 'capture_screen', {}, 'screenshot');
+    const auto = target || autoTargetForCapability('screenshot');
+    if (auto) return routeToSidecar(auto, 'capture_screen', {}, 'screenshot');
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
       const base64 = localCaptureScreen();
@@ -416,7 +431,8 @@ export const getSystemInfoTool: ToolDefinition = {
   },
   execute: async (params) => {
     const target = params.target as string | undefined;
-    if (target) return routeToSidecar(target, 'get_system_info', {}, 'system_info');
+    const auto = target || autoTargetForCapability('system_info');
+    if (auto) return routeToSidecar(auto, 'get_system_info', {}, 'system_info');
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     return JSON.stringify(localSystemInfo(), null, 2);
   },
@@ -535,13 +551,18 @@ function formatSnapshot(snap: PageSnapshot): string {
 
 export const browserNavigateTool: ToolDefinition = {
   name: 'browser_navigate',
-  description: 'Navigate the browser to a URL. Returns page text content and a list of interactive elements with [id] numbers you can reference in browser_click and browser_type. Optionally specify a "target" sidecar to use a remote browser.',
+  description: 'Navigate the browser to a URL. Returns page text content and a list of interactive elements with [id] numbers you can reference in browser_click and browser_type. Optionally specify a "target" sidecar to use a remote browser. By default the browser opens visibly so the user can watch and interact; set "headless" to true to run it hidden in the background (useful for research, or when the user is focused on something else and a popping browser window would be intrusive).',
   category: 'browser',
   parameters: {
     url: {
       type: 'string',
       description: 'The URL to navigate to',
       required: true,
+    },
+    headless: {
+      type: 'boolean',
+      description: 'Run the browser hidden in the background instead of opening a visible window the user can see and interact with. Default false (visible). The mode is set when the browser launches; switching it while a browser is already open relaunches it.',
+      required: false,
     },
     target: {
       type: 'string',
@@ -550,9 +571,9 @@ export const browserNavigateTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
-      return routeToSidecar(target, 'browser_navigate', { url: params.url }, 'browser');
+      return routeToSidecar(target, 'browser_navigate', { url: params.url, headless: params.headless }, 'browser');
     }
     if (isNoLocalTools()) return LOCAL_DISABLED_MSG;
     try {
@@ -576,7 +597,7 @@ export const browserSnapshotTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_snapshot', {}, 'browser');
     }
@@ -607,7 +628,7 @@ export const browserClickTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_click', { element_id: params.element_id }, 'browser');
     }
@@ -647,7 +668,7 @@ export const browserTypeTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_type', {
         element_id: params.element_id,
@@ -680,7 +701,7 @@ export const browserScreenshotTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_screenshot', {}, 'browser');
     }
@@ -750,7 +771,7 @@ export const browserScrollTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_scroll', {
         direction: params.direction,
@@ -785,7 +806,7 @@ export const browserEvaluateTool: ToolDefinition = {
     },
   },
   execute: async (params) => {
-    const target = params.target as string | undefined;
+    const target = (params.target as string | undefined) || autoTargetForCapability("browser");
     if (target) {
       return routeToSidecar(target, 'browser_evaluate', { expression: params.expression }, 'browser');
     }

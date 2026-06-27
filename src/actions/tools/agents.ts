@@ -12,7 +12,7 @@ import type { AgentOrchestrator } from '../../agents/orchestrator.ts';
 import type { LLMManager } from '../../llm/manager.ts';
 import type { RoleDefinition } from '../../roles/types.ts';
 import type { ToolDefinition } from './registry.ts';
-import type { AgentTaskManager } from '../../agents/task-manager.ts';
+import type { AgentTaskManager, AsyncTask } from '../../agents/task-manager.ts';
 import { createScopedToolRegistry, type ProgressCallback } from '../../agents/sub-agent-runner.ts';
 
 export type AgentToolDeps = {
@@ -21,7 +21,17 @@ export type AgentToolDeps = {
   specialists: Map<string, RoleDefinition>;
   taskManager: AgentTaskManager;
   onProgress?: ProgressCallback;
+  /** Fires when an assigned task settles -- success OR failure (the
+   *  'done' progress event only fires on the success path). */
+  onTaskComplete?: (task: AsyncTask) => void;
 };
+
+export class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+    this.name = 'HttpError';
+  }
+}
 
 // Track scoped registries for persistent agents so they can be reused across tasks
 const agentRegistries = new Map<string, ReturnType<typeof createScopedToolRegistry>>();
@@ -37,17 +47,17 @@ export type PersistentAgentSummary = {
 
 export function spawnPersistentAgent(deps: AgentToolDeps, specialistId: string) {
   if (!specialistId) {
-    throw new Error('A specialist role is required to spawn an agent.');
+    throw new HttpError(400, 'A specialist role is required to spawn an agent.');
   }
 
   const role = deps.specialists.get(specialistId);
   if (!role) {
-    throw new Error(`Unknown specialist "${specialistId}". Available: ${Array.from(deps.specialists.keys()).join(', ')}`);
+    throw new HttpError(400, `Unknown specialist "${specialistId}". Available: ${Array.from(deps.specialists.keys()).join(', ')}`);
   }
 
   const primary = deps.orchestrator.getPrimary();
   if (!primary) {
-    throw new Error('No primary agent exists');
+    throw new HttpError(503, 'No primary agent exists');
   }
 
   const agent = deps.orchestrator.spawnSubAgent(primary.id, role);
@@ -77,19 +87,19 @@ export async function assignPersistentAgentTask(
   params: { agentId: string; task: string; context?: string }
 ) {
   const { agentId, task, context = '' } = params;
-  if (!agentId) throw new Error('"agentId" is required');
-  if (!task) throw new Error('"task" is required');
+  if (!agentId) throw new HttpError(400, '"agentId" is required');
+  if (!task) throw new HttpError(400, '"task" is required');
 
   const agent = deps.orchestrator.getAgent(agentId);
-  if (!agent) throw new Error(`Agent "${agentId}" not found. Use list to see active agents.`);
+  if (!agent) throw new HttpError(404, `Agent "${agentId}" not found. Use list to see active agents.`);
 
   if (deps.taskManager.isAgentBusy(agentId)) {
-    throw new Error(`Agent "${agent.agent.role.name}" is already running a task.`);
+    throw new HttpError(409, `Agent "${agent.agent.role.name}" is already running a task.`);
   }
 
   const scopedRegistry = agentRegistries.get(agentId);
   if (!scopedRegistry) {
-    throw new Error(`No tool registry for agent "${agentId}". Was it spawned via manage_agents?`);
+    throw new HttpError(500, `No tool registry for agent "${agentId}". Was it spawned via manage_agents?`);
   }
 
   deps.onProgress?.({
@@ -106,6 +116,7 @@ export async function assignPersistentAgentTask(
     llmManager: deps.llmManager,
     toolRegistry: scopedRegistry,
     onProgress: deps.onProgress,
+    onComplete: deps.onTaskComplete,
   });
 
   console.log(`[ManageAgents] Assigned task ${taskId} to ${agent.agent.role.name}`);
@@ -133,13 +144,28 @@ export function listPersistentAgents(deps: AgentToolDeps) {
     busy: deps.taskManager.isAgentBusy(a.id),
   }));
 
-  const tasks = deps.taskManager.listTasks().map(t => ({
-    task_id: t.id,
-    agent_name: t.agentName,
-    status: t.status,
-    task: t.task.slice(0, 100),
-    elapsed_seconds: Math.round(((t.completedAt ?? Date.now()) - t.startedAt) / 1000),
-  }));
+  const tasks = deps.taskManager.listTasks().map(t => {
+    // Trim and clip the agent's response so the strip can render an inline
+    // preview after completion without flooding the small panel. Strip
+    // markdown noise (asterisks, leading list markers) and collapse
+    // whitespace so the snippet reads cleanly in a 2-line clamp.
+    const rawResponse = t.result?.response ?? '';
+    const cleaned = rawResponse
+      .replace(/^\s*[-*•]\s+/gm, '')
+      .replace(/[*_`]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const result_preview = cleaned ? cleaned.slice(0, 200) : null;
+    return {
+      task_id: t.id,
+      agent_name: t.agentName,
+      status: t.status,
+      task: t.task.slice(0, 200),
+      elapsed_seconds: Math.round(((t.completedAt ?? Date.now()) - t.startedAt) / 1000),
+      completed_at: t.completedAt ?? null,
+      result_preview,
+    };
+  });
 
   return {
     active_agents: agents.length,
@@ -151,12 +177,16 @@ export function listPersistentAgents(deps: AgentToolDeps) {
 }
 
 export function terminatePersistentAgent(deps: AgentToolDeps, agentId: string) {
-  if (!agentId) throw new Error('"agentId" is required');
+  if (!agentId) throw new HttpError(400, '"agentId" is required');
+
+  if (deps.orchestrator.getPrimary()?.id === agentId) {
+    throw new HttpError(400, 'Cannot terminate the primary agent.');
+  }
 
   const agent = deps.orchestrator.getAgent(agentId);
-  if (!agent) throw new Error(`Agent "${agentId}" not found`);
+  if (!agent) throw new HttpError(404, `Agent "${agentId}" not found`);
   if (!agentRegistries.has(agentId)) {
-    throw new Error(`Agent "${agentId}" is not a persistent managed agent.`);
+    throw new HttpError(404, `Agent "${agentId}" is not a persistent managed agent.`);
   }
 
   const name = agent.agent.role.name;

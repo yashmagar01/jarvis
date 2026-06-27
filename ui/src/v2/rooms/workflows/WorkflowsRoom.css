@@ -1,0 +1,614 @@
+/* Workflows Room (Phase 4 stage 1) — flow list + run history detail panel.
+   Matches the conventions used by Goals/Tools/Agents (var tokens, paper
+   surfaces, soft rules). */
+
+.wf-room {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  /* Size against this element's own width, not the viewport. The room is
+     rendered inline inside a narrow thread card (.v2-roomwin__body) as well
+     as full-screen, so viewport media queries can't tell "cramped card" from
+     "wide page". Container queries below key off this width instead. */
+  container-type: inline-size;
+  container-name: wfroom;
+}
+
+.wf-room__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--s-4) var(--s-6) var(--s-3);
+}
+
+.wf-room__count {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 0.85rem;
+}
+
+.wf-room__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+/* Narrow card: let tabs + actions wrap onto separate lines instead of
+   squeezing the count label into a two-line wrap between the buttons. */
+@container wfroom (max-width: 560px) {
+  .wf-room__header {
+    flex-wrap: wrap;
+    gap: var(--s-2);
+  }
+  .wf-room__actions { flex-wrap: wrap; }
+}
+
+.wf-toast {
+  margin: 0 var(--s-6) var(--s-3);
+  padding: var(--s-2) var(--s-3);
+  border-radius: var(--r-2);
+  font-size: 0.85rem;
+  border: 1px solid var(--rule-soft);
+  background: var(--paper-2);
+}
+.wf-toast--ok { border-color: var(--accent-ok-soft, #134e4a); color: var(--accent-ok, #5eead4); }
+.wf-toast--warn { border-color: var(--accent-warn-soft, #713f12); color: var(--accent-warn, #fbbf24); }
+
+.wf-room__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: var(--s-4);
+  padding: 0 var(--s-6) var(--s-6);
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Below ~680px the two-pane split gets too tight (detail column clips its
+   stats + run-history columns), so stack list-over-detail. */
+@container wfroom (max-width: 680px) {
+  .wf-room__layout { grid-template-columns: 1fr; }
+}
+
+.wf-room__list,
+.wf-room__detail {
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  overflow: auto;
+  min-height: 0;
+}
+
+/* ── flow list ── */
+
+.wf-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.wf-list__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  border-bottom: 1px solid var(--rule-soft);
+  cursor: pointer;
+}
+.wf-list__row:hover { background: var(--paper-3); }
+.wf-list__row--selected { background: var(--paper-3); border-left: 3px solid var(--accent-1, #5eead4); }
+.wf-list__row:last-child { border-bottom: none; }
+
+.wf-list__main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  min-width: 0;
+}
+
+.wf-list__title {
+  font-weight: 500;
+  color: var(--ink-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wf-list__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: 0.78rem;
+  color: var(--ink-2);
+}
+
+.wf-list__hint {
+  color: var(--ink-3);
+}
+
+.wf-list__buttons {
+  display: flex;
+  gap: var(--s-1);
+  flex-shrink: 0;
+}
+
+/* Narrow card: the title + meta + up to 5 action buttons can't sit on one
+   line without colliding. Drop the buttons onto their own row beneath the
+   title/meta and right-align them. */
+@container wfroom (max-width: 560px) {
+  .wf-list__row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--s-2);
+  }
+  .wf-list__buttons {
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+}
+
+/* ── empty / placeholder ── */
+
+.wf-empty,
+.wf-detail-placeholder {
+  padding: var(--s-6);
+  color: var(--ink-2);
+  text-align: center;
+}
+
+.wf-empty p { margin: var(--s-1) 0; }
+.wf-empty__hint { font-size: 0.85rem; color: var(--ink-3); }
+.wf-empty__hint code,
+.wf-list__title code,
+.wf-detail__title code,
+.wf-runs__kv code {
+  background: var(--paper-3);
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 0.78rem;
+}
+
+/* ── detail ── */
+
+.wf-detail {
+  padding: var(--s-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.wf-detail__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-2);
+}
+
+.wf-detail__title h3 {
+  margin: 0 0 var(--s-1);
+  font-size: 1rem;
+  color: var(--ink-1);
+}
+
+.wf-detail__title p {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--ink-3);
+}
+
+.wf-detail__stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--s-2);
+}
+
+.wf-stat {
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  padding: var(--s-2) var(--s-3);
+  text-align: center;
+}
+.wf-stat__value {
+  font-size: 1.1rem;
+  font-weight: 500;
+  color: var(--ink-1);
+}
+.wf-stat__label {
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.wf-stat--ok .wf-stat__value { color: var(--accent-ok, #5eead4); }
+.wf-stat--accent .wf-stat__value { color: var(--accent-warn, #fbbf24); }
+
+.wf-detail__runs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.wf-detail__runs-header h4 {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.wf-detail__empty {
+  margin: 0;
+  padding: var(--s-3);
+  color: var(--ink-3);
+  font-size: 0.85rem;
+}
+
+/* ── run rows ── */
+
+.wf-runs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+
+.wf-runs__row {
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+}
+
+.wf-runs__head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.wf-runs__head:hover { background: var(--paper-2); }
+
+.wf-runs__head-left,
+.wf-runs__head-right {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+/* Let the left group (status chip + failed-step label) absorb the squeeze so
+   the time + duration on the right are always fully visible. */
+.wf-runs__head-left { min-width: 0; }
+.wf-runs__head-right { flex-shrink: 0; }
+
+.wf-runs__time,
+.wf-runs__duration {
+  font-size: 0.78rem;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.wf-runs__failed-step {
+  font-size: 0.75rem;
+  color: var(--ink-3);
+  font-style: italic;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wf-runs__paused {
+  font-size: 0.8rem;
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2);
+  padding: var(--s-2);
+  line-height: 1.45;
+}
+.wf-runs__paused code {
+  background: var(--surface-3);
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 0.78rem;
+}
+.wf-runs__paused-err { color: var(--accent-1, #f87171); }
+.wf-runs__paused-list { list-style: disc inside; margin: 6px 0 0; padding: 0; }
+.wf-runs__paused-list li { margin: 2px 0; }
+.wf-runs__paused-step { font-weight: 600; color: var(--ink-1); }
+
+.wf-runs__body {
+  padding: var(--s-2) var(--s-3) var(--s-3);
+  border-top: 1px solid var(--rule-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+
+.wf-runs__kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--s-1) var(--s-3);
+  margin: 0;
+  font-size: 0.8rem;
+}
+.wf-runs__kv dt { color: var(--ink-3); }
+.wf-runs__kv dd { margin: 0; color: var(--ink-2); }
+
+.wf-runs__steps summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--ink-2);
+  padding: var(--s-1) 0;
+}
+
+.wf-runs__steps pre {
+  margin: var(--s-1) 0 0;
+  padding: var(--s-2);
+  background: var(--paper-2);
+  color: var(--ink);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── Tabs ────────────────────────────────────────────────────────────── */
+
+.wf-room__tabs {
+  display: flex;
+  gap: var(--s-1);
+}
+.wf-room__tab {
+  background: transparent;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  padding: 4px 12px;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.wf-room__tab:hover { background: var(--surface-2); color: var(--ink-1); }
+.wf-room__tab--active {
+  background: var(--surface-3);
+  color: var(--ink-1);
+  border-color: var(--rule-strong, var(--rule-soft));
+}
+
+/* ── Connections panel ───────────────────────────────────────────────── */
+
+.wf-conn { display: flex; flex-direction: column; gap: var(--s-3); padding: var(--s-3) var(--s-6); }
+.wf-conn__header { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-3); }
+.wf-conn__title { margin: 0; font-size: 1rem; font-weight: 600; color: var(--ink-1); }
+.wf-conn__subtitle { margin: 2px 0 0; font-size: 0.78rem; color: var(--ink-3); }
+.wf-conn__actions { display: flex; gap: var(--s-1); }
+
+.wf-conn__sources {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s-1);
+  padding: var(--s-2);
+  background: var(--surface-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  font-size: 0.78rem;
+  color: var(--ink-2);
+}
+.wf-conn__sources-label { font-weight: 600; color: var(--ink-1); }
+.wf-conn__sources-help { color: var(--ink-3); font-style: italic; flex-basis: 100%; }
+
+.wf-conn__empty {
+  padding: var(--s-4);
+  text-align: center;
+  color: var(--ink-3);
+  border: 1px dashed var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  font-size: 0.85rem;
+}
+
+.wf-conn__list { display: flex; flex-direction: column; gap: var(--s-2); list-style: none; padding: 0; margin: 0; }
+.wf-conn__row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  background: var(--surface-1);
+}
+.wf-conn__row-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+.wf-conn__row-actions { display: flex; gap: var(--s-1); }
+.wf-conn__row-main { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; }
+.wf-conn__row-name { font-weight: 600; color: var(--ink-1); }
+.wf-conn__row-extid { font-family: monospace; font-size: 0.78rem; color: var(--ink-3); }
+.wf-conn__row-meta { display: flex; gap: var(--s-3); font-size: 0.72rem; color: var(--ink-3); }
+.wf-conn__row-meta code { font-size: 0.7rem; }
+.wf-conn__form--inline { background: var(--surface-1); border: 1px dashed var(--rule-soft); }
+
+.wf-conn__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  background: var(--surface-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+}
+.wf-conn__form-row { display: flex; gap: var(--s-2); flex-wrap: wrap; }
+.wf-conn__form label { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 180px; font-size: 0.78rem; color: var(--ink-2); }
+.wf-conn__form input,
+.wf-conn__form select,
+.wf-conn__form textarea {
+  background: var(--surface-1);
+  border: 1px solid var(--rule-soft);
+  color: var(--ink-1);
+  padding: 6px 8px;
+  border-radius: var(--radius-2, 6px);
+  font-size: 0.85rem;
+}
+.wf-conn__form textarea { font-family: monospace; font-size: 0.78rem; }
+.wf-conn__form-value { display: flex; flex-direction: column; gap: 4px; }
+.wf-conn__form-err { color: var(--accent-1, #f87171); font-size: 0.72rem; }
+.wf-conn__form-actions { display: flex; justify-content: flex-end; }
+
+/* Library panel: curated activepieces community pieces, install/uninstall. */
+.wf-lib { display: flex; flex-direction: column; gap: var(--s-3); padding: var(--s-3) var(--s-6); }
+.wf-lib__header { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-3); }
+.wf-lib__title { margin: 0; font-size: 1rem; font-weight: 600; color: var(--ink-1); }
+.wf-lib__subtitle { margin: 2px 0 0; font-size: 0.78rem; color: var(--ink-3); }
+.wf-lib__actions { display: flex; gap: var(--s-1); }
+.wf-lib__intro {
+  margin: 0 0 var(--s-2);
+  font-size: 0.78rem;
+  color: var(--ink-3);
+  line-height: 1.5;
+}
+.wf-lib__intro code { font-family: monospace; font-size: 0.74rem; color: var(--ink-2); }
+.wf-lib__empty {
+  padding: var(--s-4);
+  text-align: center;
+  color: var(--ink-3);
+  font-size: 0.85rem;
+}
+.wf-lib__empty-section {
+  padding: var(--s-3);
+  color: var(--ink-3);
+  font-size: 0.82rem;
+  font-style: italic;
+}
+
+/* Search input sits between the header and the tier sections. */
+.wf-lib__search {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  color: var(--ink);
+  font-size: 0.85rem;
+  font-family: var(--font-sans);
+  box-sizing: border-box;
+}
+.wf-lib__search:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+
+/* Tier sections (Verified / Community). Each has a small heading + hint,
+   and the community section is a button so it can collapse. */
+.wf-lib__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  margin-bottom: var(--s-3);
+}
+.wf-lib__section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink-1);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.wf-lib__section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink-1);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  font-family: var(--font-sans);
+}
+.wf-lib__section-toggle:hover { color: var(--ink); }
+.wf-lib__section-count {
+  font-weight: 400;
+  font-size: 0.7rem;
+  color: var(--ink-3);
+  letter-spacing: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-pill);
+  background: var(--paper-2);
+  text-transform: none;
+}
+.wf-lib__section-hint {
+  margin: 0;
+  font-size: 0.76rem;
+  color: var(--ink-3);
+  line-height: 1.45;
+}
+.wf-lib__section-hint--warn {
+  padding: var(--s-2) var(--s-3);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-2);
+}
+.wf-lib__list { display: flex; flex-direction: column; gap: var(--s-2); list-style: none; padding: 0; margin: 0; }
+.wf-lib__row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  background: var(--surface-1);
+}
+.wf-lib__row-main { display: flex; flex-direction: column; gap: 4px; flex: 1 1 auto; min-width: 0; }
+.wf-lib__row-title { display: flex; align-items: center; gap: var(--s-1); flex-wrap: wrap; }
+.wf-lib__row-name { font-weight: 600; color: var(--ink-1); }
+.wf-lib__row-desc { margin: 0; font-size: 0.82rem; color: var(--ink-2); line-height: 1.4; }
+.wf-lib__row-meta { display: flex; gap: var(--s-2); font-size: 0.72rem; color: var(--ink-3); align-items: center; flex-wrap: wrap; }
+.wf-lib__row-pkg { font-family: monospace; font-size: 0.72rem; color: var(--ink-3); }
+.wf-lib__row-source { display: inline-flex; gap: 3px; align-items: center; color: var(--ink-3); text-decoration: none; }
+.wf-lib__row-source:hover { color: var(--ink-1); }
+.wf-lib__row-actions { display: flex; gap: var(--s-1); flex-shrink: 0; }
+
+/* Inline-expanding trigger warning: click the chip to reveal the full
+   message below in a wrapping detail line. Beats the native title tooltip
+   for long messages. */
+.wf-list__warning-wrap { display: inline-flex; flex-direction: column; gap: 4px; }
+.wf-list__warning-wrap .chip { cursor: pointer; }
+.wf-list__warning-full {
+  font-size: 0.78rem;
+  color: var(--ink-2);
+  background: var(--paper-3);
+  border-left: 2px solid var(--accent-warn, #fbbf24);
+  border-radius: 0 var(--r-2) var(--r-2) 0;
+  padding: 4px 8px;
+  max-width: 100%;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.4;
+}

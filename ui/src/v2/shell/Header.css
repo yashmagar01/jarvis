@@ -1,0 +1,150 @@
+.v2-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-5);
+  padding: var(--s-3) var(--s-6);
+  min-height: 52px;
+  background: var(--paper);
+}
+
+.v2-header__left {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  min-width: 0;
+}
+
+.v2-header__connection {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.v2-header__conn-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+}
+
+.v2-header__conn-dot--live { background: var(--ok); }
+.v2-header__conn-dot--degraded { background: var(--warn); }
+.v2-header__conn-dot--offline { background: var(--ink-3); }
+
+.v2-header__right {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.v2-header__palette {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: 6px 10px 6px 12px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-pill);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  color: var(--ink-3);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out);
+  min-width: 180px;
+}
+
+.v2-header__palette:hover {
+  background: var(--paper-3);
+}
+
+.v2-header__palette:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.v2-header__palette-icon {
+  color: var(--ink-3);
+  display: inline-flex;
+}
+
+.v2-header__palette-label {
+  flex: 1;
+  text-align: left;
+}
+
+.v2-header__iconbtn {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  border-radius: var(--r-pill);
+  position: relative;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+
+.v2-header__iconbtn:hover {
+  background: var(--paper-3);
+}
+
+.v2-header__iconbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.v2-header__iconbtn[data-active="true"] {
+  background: var(--paper-3);
+  color: var(--ink);
+}
+
+.v2-header__notif-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+}
+
+/* Wraps the bell + drawer so the drawer can anchor to the bell. */
+.v2-header__notif-anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+/* Numeric badge on the bell — replaces the dot. */
+.v2-header__notif-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+  pointer-events: none;
+  font-weight: 600;
+  letter-spacing: 0;
+  box-shadow: 0 0 0 2px var(--paper);
+}
+
+.v2-header__legacy {
+  margin-left: var(--s-3);
+  padding-left: var(--s-3);
+  border-left: var(--hair);
+}

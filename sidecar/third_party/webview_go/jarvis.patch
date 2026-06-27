@@ -1,0 +1,96 @@
+diff --git a/libs/webview/include/webview.h b/libs/webview/include/webview.h
+--- a/libs/webview/include/webview.h
++++ b/libs/webview/include/webview.h
+@@ -1471,6 +1471,7 @@
+ #include <CoreGraphics/CoreGraphics.h>
+ #include <objc/NSObjCRuntime.h>
+ #include <objc/objc-runtime.h>
++#include <pthread.h> // PATCHED (jarvis): for pthread_main_np() in set_up_window
+ 
+ namespace webview {
+ namespace detail {
+@@ -1634,7 +1635,17 @@
+   void *window_impl() override { return (void *)m_window; }
+   void *widget_impl() override { return (void *)m_webview; }
+   void *browser_controller_impl() override { return (void *)m_webview; };
+-  void terminate_impl() override { stop_run_loop(); }
++  void terminate_impl() override {
++    // PATCHED (jarvis): no-op on Cocoa. The sidecar runs every webview window
++    // (panels, settings, logs) under the tray's single shared [NSApp run] loop.
++    // on_window_destroyed() calls terminate() when the LAST webview window
++    // closes; the upstream behavior here is stop_run_loop() -> [NSApp stop],
++    // which stops the tray's loop. Re-entering [NSApp run] afterwards leaves the
++    // main dispatch queue unserviced, so the next webview.New()'s dispatch_sync
++    // to the main thread hangs forever (and the pebble's main-queue paint stalls
++    // + tray quit can't post). The app must only ever quit via the tray's own
++    // jarvisTrayQuit ([NSApp stop] + gTrayShouldQuit), never on a window close.
++  }
+   void run_impl() override {
+     auto app = get_shared_application();
+     objc::msg_send<void>(app, "run"_sel);
+@@ -1895,6 +1906,19 @@
+     dispatch([this] { on_window_destroyed(); });
+   }
+   void set_up_window() {
++    // PATCHED (jarvis): NSWindow / WKWebView must be created on the main thread.
++    // The host spawns panels on background goroutines, so when we're off the
++    // main thread marshal this whole method synchronously onto the main queue
++    // (the host's [NSApp run] loop pumps it). Without this AppKit aborts with
++    // "NSWindow should only be instantiated on the main thread!". We use
++    // pthread_main_np() rather than [NSThread isMainThread] because routing a
++    // bool return through webview's objc_msgSend wrapper mis-reads on arm64.
++    if (pthread_main_np() == 0) {
++      dispatch_sync_f(dispatch_get_main_queue(), this, [](void *ctx) {
++        static_cast<cocoa_wkwebview_engine *>(ctx)->set_up_window();
++      });
++      return;
++    }
+     objc::autoreleasepool arp;
+ 
+     // Main window
+@@ -2022,23 +2046,14 @@
+ 
+   // Blocks while depleting the run loop of events.
+   void deplete_run_loop_event_queue() {
+-    objc::autoreleasepool arp;
+-    auto app = get_shared_application();
+-    bool done{};
+-    dispatch([&] { done = true; });
+-    auto mask = NSUIntegerMax; // NSEventMaskAny
+-    // NSDefaultRunLoopMode
+-    auto mode = objc::msg_send<id>("NSString"_cls, "stringWithUTF8String:"_sel,
+-                                   "kCFRunLoopDefaultMode");
+-    while (!done) {
+-      objc::autoreleasepool arp;
+-      auto event = objc::msg_send<id>(
+-          app, "nextEventMatchingMask:untilDate:inMode:dequeue:"_sel, mask,
+-          nullptr, mode, YES);
+-      if (event) {
+-        objc::msg_send<void>(app, "sendEvent:"_sel, event);
+-      }
+-    }
++    // PATCHED (jarvis): no-op on Cocoa. The host destroys panels by running
++    // wv.Destroy() on the main queue (panels live under the tray's shared
++    // [NSApp run] loop). The original pump dispatches a `done=true` sentinel
++    // onto the SAME serial main queue and spins until it runs — but it can't
++    // run until wv.Destroy() returns, so the main thread deadlocks: it keeps
++    // pumping events (the tray still responds) while the dispatch queue is
++    // frozen, so reopening a panel, the palette, and pebble cursor-follow all
++    // hang. The window still closes via [m_window close] in the destructor.
+   }
+ 
+   bool m_debug{};
+@@ -3179,9 +3194,10 @@
+                     nullptr, hInstance, this);
+ 
+     if (m_owns_window) {
+-      ShowWindow(m_window, SW_SHOW);
+-      UpdateWindow(m_window);
+-      SetFocus(m_window);
++      // PATCHED (jarvis): create the window HIDDEN so the host can reveal it
++      // once the page has loaded, avoiding the empty-window flash during
++      // WebView2 init. The host calls ShowWindow(SW_SHOW) itself.
++      ShowWindow(m_window, SW_HIDE);
+     }
+ 
+     auto cb =

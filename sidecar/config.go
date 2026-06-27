@@ -11,8 +11,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var configDir = filepath.Join(homeDir(), ".jarvis-sidecar")
-var configFile = filepath.Join(configDir, "config.yaml")
+// The sidecar shares the ~/.jarvis data folder with the brain (they rarely run
+// on the same host); its files are named distinctly so they can't collide with
+// brain files (jarvis.pid, sidecar-keys/, the db, etc.). captures/ is shared.
+var configDir = filepath.Join(homeDir(), ".jarvis")
+var configFile = filepath.Join(configDir, "sidecar.yaml")
 
 func homeDir() string {
 	h, err := os.UserHomeDir()
@@ -25,7 +28,8 @@ func homeDir() string {
 func defaultConfig() SidecarConfig {
 	return SidecarConfig{
 		Capabilities: []SidecarCapability{
-			CapTerminal, CapFilesystem, CapClipboard, CapScreenshot, CapSystemInfo, CapAwareness, CapDesktop, CapBrowser,
+			CapTerminal, CapFilesystem, CapClipboard, CapScreenshot, CapSystemInfo, CapAwareness, CapDesktop, CapBrowser, CapOCR, CapWindows, CapPebble, CapSubPebble,
+			CapFileWatch, CapProcesses, CapNotifications,
 		},
 		Terminal: TerminalConfig{
 			BlockedCommands: []string{},
@@ -43,6 +47,8 @@ func defaultConfig() SidecarConfig {
 			WindowIntervalMs:   2000,
 			MinChangeThreshold: 0.02,
 			StuckThresholdMs:   120000,
+			OCREnabled:         true,
+			CaptureDir:         filepath.Join(homeDir(), ".jarvis", "captures"),
 		},
 	}
 }
@@ -74,6 +80,20 @@ func LoadConfig() (*SidecarConfig, error) {
 	}
 	if len(cfg.Capabilities) == 0 {
 		cfg.Capabilities = defaultConfig().Capabilities
+	} else {
+		// Merge in any default capabilities that aren't already present in the
+		// saved config. This makes new capabilities (e.g. CapWindows added in
+		// Phase 2) auto-enable on existing installs without requiring users to
+		// hand-edit ~/.jarvis-sidecar/config.yaml.
+		have := make(map[SidecarCapability]bool, len(cfg.Capabilities))
+		for _, c := range cfg.Capabilities {
+			have[c] = true
+		}
+		for _, c := range defaultConfig().Capabilities {
+			if !have[c] {
+				cfg.Capabilities = append(cfg.Capabilities, c)
+			}
+		}
 	}
 
 	// Awareness defaults
@@ -89,19 +109,38 @@ func LoadConfig() (*SidecarConfig, error) {
 	if cfg.Awareness.StuckThresholdMs == 0 {
 		cfg.Awareness.StuckThresholdMs = 120000
 	}
+	if cfg.Awareness.CaptureDir == "" {
+		cfg.Awareness.CaptureDir = filepath.Join(homeDir(), ".jarvis", "captures")
+	}
 
 	return &cfg, nil
 }
 
 func SaveConfig(cfg *SidecarConfig) error {
-	if err := os.MkdirAll(configDir, 0755); err != nil {
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return err
+	}
+	if err := os.Chmod(configDir, 0700); err != nil {
 		return err
 	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configFile, data, 0644)
+	// O_NOFOLLOW prevents a hostile symlink at configFile from redirecting
+	// the write to an unrelated target (e.g. ~/.bash_history).
+	f, err := os.OpenFile(configFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|oNoFollow, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(configFile, 0600)
 }
 
 func DecodeJWTPayload(token string) (*SidecarTokenClaims, error) {

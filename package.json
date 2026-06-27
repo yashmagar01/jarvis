@@ -1,6 +1,6 @@
 {
   "name": "@usejarvis/brain",
-  "version": "0.4.0",
+  "version": "0.8.0",
   "description": "J.A.R.V.I.S. — Just A Rather Very Intelligent System. An always-on autonomous AI daemon.",
   "module": "src/daemon/index.ts",
   "type": "module",
@@ -15,7 +15,13 @@
     "url": "git+https://github.com/vierisid/jarvis.git"
   },
   "license": "SEE LICENSE IN LICENSE",
-  "keywords": ["jarvis", "ai", "daemon", "assistant", "cli"],
+  "keywords": [
+    "jarvis",
+    "ai",
+    "daemon",
+    "assistant",
+    "cli"
+  ],
   "files": [
     "bin/",
     "src/",
@@ -30,8 +36,13 @@
     "dev": "bun --hot run src/daemon/index.ts",
     "copy:models": "mkdir -p ui/public/openwakeword/models ui/public/ort && cp node_modules/openwakeword-wasm-browser/models/melspectrogram.onnx node_modules/openwakeword-wasm-browser/models/embedding_model.onnx node_modules/openwakeword-wasm-browser/models/silero_vad.onnx node_modules/openwakeword-wasm-browser/models/hey_jarvis_v0.1.onnx ui/public/openwakeword/models/ && cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs ui/public/ort/",
     "prebuild:ui": "bun run copy:models",
-    "build:ui": "bun build ui/index.html --outdir ui/dist",
+    "build:ui": "bun build ui/index.html ui/pebble.html --outdir ui/dist",
     "test": "bun test",
+    "check:no-ee": "bun run scripts/check-no-ee-imports.ts",
+    "sync:pieces": "bun run scripts/sync-pieces-catalog.ts",
+    "check:pieces": "bun run scripts/sync-pieces-catalog.ts --check",
+    "build:workflows": "bun run scripts/build-workflows.ts",
+    "audit:piece-outputs": "bun run scripts/audit-piece-outputs.ts",
     "db:init": "bun run src/vault/schema.ts",
     "setup": "bun run scripts/setup-config.ts",
     "test:llm": "bun run src/llm/test.ts",
@@ -39,7 +50,7 @@
     "setup:google": "bun run src/scripts/google-setup.ts",
     "postinstall": "node scripts/ensure-bun.cjs && (bun run copy:models 2>/dev/null || true)",
     "prepare": "git config core.hooksPath .githooks 2>/dev/null || true",
-    "prepublishOnly": "bun run copy:models && bun run build:ui"
+    "prepublishOnly": "bun run copy:models && bun run build:ui && bun run build:workflows"
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",
@@ -53,12 +64,17 @@
     "@codemirror/view": "^6.40.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@xenova/transformers": "^2.17.2",
     "@xyflow/react": "^12.10.1",
     "codemirror": "^6.0.2",
     "discord.js": "^14.25.1",
     "edge-tts-universal": "^1.4.0",
+    "fuse.js": "^7.3.0",
     "highlight.js": "^11.11.1",
     "jose": "^6.2.0",
+    "lucide-react": "^1.9.0",
+    "nanoid": "^5.1.11",
+    "onnxruntime-web": "^1.20.1",
     "openwakeword-wasm-browser": "^0.1.1",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
@@ -66,12 +82,13 @@
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
     "sharp": "^0.34.5",
+    "socket.io": "^4.8.3",
     "tailwindcss": "^4.2.1",
-    "tesseract.js": "^7.0.0",
     "yaml": "^2.7.0"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "socket.io-client": "^4.8.3"
   },
   "peerDependencies": {
     "typescript": "^5"

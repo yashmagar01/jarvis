@@ -6,8 +6,30 @@ import type {
   LLMStreamEvent,
   LLMTool,
   LLMToolCall,
+  LLMErrorCode,
 } from './provider.ts';
+import { classifyErrorString } from './provider.ts';
 import { compactHistory, calculateHistoryBudget } from './history.ts';
+
+/** Map Anthropic's SSE-level error.type to our canonical code. */
+function classifyAnthropicErrorType(type: string): LLMErrorCode {
+  switch (type) {
+    case 'authentication_error':
+    case 'permission_error':
+      return 'auth';
+    case 'rate_limit_error':
+      return 'rate_limit';
+    case 'overloaded_error':
+    case 'api_error':
+      return 'server';
+    case 'invalid_request_error':
+      return 'bad_request';
+    case 'not_found_error':
+      return 'not_found';
+    default:
+      return 'unknown';
+  }
+}
 
 type AnthropicMessage = {
   role: 'user' | 'assistant';
@@ -55,6 +77,20 @@ type AnthropicStreamEvent =
 
 const MAX_RETRIES = 0;
 const RETRY_BASE_DELAY_MS = 5000; // 5s, 10s, 20s
+
+/**
+ * Some Anthropic models reject sampling params (temperature, top_p, top_k)
+ * with 400 invalid_request_error ("temperature is deprecated for this model")
+ * if the field is present in the body -- even at default values. Opus 4.7 is
+ * the first family to enforce this; future models may follow.
+ *
+ * If you see that 400 again for a NEW model id, add its pattern to the regex
+ * below. Do NOT try to pick a "safe" temperature value: the check is on
+ * presence, not value. The only fix is to omit the field entirely.
+ */
+function modelRejectsTemperature(model: string): boolean {
+  return /claude-opus-4-7/i.test(model);
+}
 
 export class AnthropicProvider implements LLMProvider {
   name = 'anthropic';
@@ -120,7 +156,9 @@ export class AnthropicProvider implements LLMProvider {
     };
 
     if (system) body.system = system;
-    if (temperature !== undefined) body.temperature = temperature;
+    if (temperature !== undefined && !modelRejectsTemperature(model)) {
+      body.temperature = temperature;
+    }
     if (tools && tools.length > 0) {
       body.tools = this.convertTools(tools);
       // Anthropic uses budget_tokens for tool use (no explicit tool_choice needed)
@@ -147,7 +185,9 @@ export class AnthropicProvider implements LLMProvider {
     };
 
     if (system) body.system = system;
-    if (temperature !== undefined) body.temperature = temperature;
+    if (temperature !== undefined && !modelRejectsTemperature(model)) {
+      body.temperature = temperature;
+    }
     if (tools && tools.length > 0) {
       body.tools = this.convertTools(tools);
       // Anthropic automatically uses tools when provided (no explicit tool_choice needed)
@@ -160,12 +200,13 @@ export class AnthropicProvider implements LLMProvider {
     try {
       response = await this.fetchWithRetry(JSON.stringify(body), true);
     } catch (err) {
-      yield { type: 'error', error: err instanceof Error ? err.message : String(err) };
+      const message = err instanceof Error ? err.message : String(err);
+      yield { type: 'error', error: message, code: classifyErrorString(message) };
       return;
     }
 
     if (!response.body) {
-      yield { type: 'error', error: 'No response body' };
+      yield { type: 'error', error: 'No response body', code: 'network' };
       return;
     }
 
@@ -242,7 +283,11 @@ export class AnthropicProvider implements LLMProvider {
                 usage.output_tokens = event.delta.usage.output_tokens;
               }
             } else if (event.type === 'error') {
-              yield { type: 'error', error: `${event.error.type}: ${event.error.message}` };
+              yield {
+                type: 'error',
+                error: `${event.error.type}: ${event.error.message}`,
+                code: classifyAnthropicErrorType(event.error.type),
+              };
               return;
             }
           } catch (err) {
@@ -264,7 +309,7 @@ export class AnthropicProvider implements LLMProvider {
         },
       };
     } catch (err) {
-      yield { type: 'error', error: `Stream error: ${err}` };
+      yield { type: 'error', error: `Stream error: ${err}`, code: 'network' };
     }
   }
 

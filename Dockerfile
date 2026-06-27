@@ -19,6 +19,8 @@ WORKDIR /app
 
 # Copy only dependency manifests for layer caching
 COPY package.json bun.lock ./
+# scripts/ holds the postinstall helper (ensure-bun.cjs) referenced by package.json
+COPY scripts/ scripts/
 
 # Install all dependencies (includes devDependencies needed for UI build)
 RUN bun install --frozen-lockfile
@@ -94,6 +96,13 @@ RUN groupadd -r jarvis && useradd -r -g jarvis -d /data -s /bin/bash jarvis && \
 
 ENV JARVIS_HOME=/data
 ENV NODE_ENV=production
+# Signal to `jarvis update` / `jarvis uninstall` that this is a container
+# install. Both commands refuse to run here and point the user at the
+# correct host-side docker commands.
+ENV JARVIS_INSTALL_METHOD=docker
+# Durable on-disk marker as a belt-and-suspenders fallback if the env var
+# is ever unset (e.g. someone runs `docker exec -e JARVIS_INSTALL_METHOD= ...`).
+RUN echo '{"method":"docker","installedAt":"image-build"}' > /app/.install-method
 
 EXPOSE 3142
 

@@ -23,6 +23,13 @@ export type AsyncTask = {
   startedAt: number;
   completedAt: number | null;
   result: SubAgentResult | null;
+  /**
+   * Concise ambient-display summary of `result.response`, populated by the
+   * daemon shortly after completion via a one-shot LLM call. Used by the
+   * sub-pebble bubble to show a glance-readable version of long responses.
+   * Null until the summary lands (or if summarization failed).
+   */
+  summary: string | null;
 };
 
 export type LaunchOptions = {
@@ -35,8 +42,33 @@ export type LaunchOptions = {
   onComplete?: (task: AsyncTask) => void;
 };
 
+export type TaskLifecycleEvent = 'launch' | 'complete' | 'fail';
+export type TaskLifecycleListener = (event: TaskLifecycleEvent, task: AsyncTask) => void;
+
 export class AgentTaskManager {
   private tasks = new Map<string, AsyncTask>();
+  private listeners = new Set<TaskLifecycleListener>();
+
+  /**
+   * Subscribe to lifecycle events (launch / complete / fail) for every task
+   * that flows through this manager. Returns an unsubscribe function.
+   * Used by the daemon's ambient UI to spawn / update / close sub-pebble
+   * overlays as background work runs.
+   */
+  subscribeLifecycle(listener: TaskLifecycleListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private emit(event: TaskLifecycleEvent, task: AsyncTask): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event, task);
+      } catch (err) {
+        console.error('[TaskManager] lifecycle listener error:', err);
+      }
+    }
+  }
 
   /**
    * Launch a sub-agent task in the background. Returns task ID immediately.
@@ -55,9 +87,11 @@ export class AgentTaskManager {
       startedAt: Date.now(),
       completedAt: null,
       result: null,
+      summary: null,
     };
 
     this.tasks.set(taskId, asyncTask);
+    this.emit('launch', asyncTask);
 
     // Fire runSubAgent without awaiting — runs in background
     runSubAgent({
@@ -72,6 +106,7 @@ export class AgentTaskManager {
       asyncTask.completedAt = Date.now();
       asyncTask.result = result;
       console.log(`[TaskManager] Task ${taskId} completed (${asyncTask.agentName})`);
+      this.emit('complete', asyncTask);
       onComplete?.(asyncTask);
     }).catch((err) => {
       asyncTask.status = 'failed';
@@ -81,8 +116,11 @@ export class AgentTaskManager {
         response: `Task failed: ${err instanceof Error ? err.message : String(err)}`,
         toolsUsed: [],
         tokensUsed: { input: 0, output: 0 },
+        terminationReason: 'error',
+        messages: [],
       };
       console.error(`[TaskManager] Task ${taskId} failed (${asyncTask.agentName}):`, err);
+      this.emit('fail', asyncTask);
       onComplete?.(asyncTask);
     });
 
@@ -94,6 +132,18 @@ export class AgentTaskManager {
    */
   getTask(taskId: string): AsyncTask | undefined {
     return this.tasks.get(taskId);
+  }
+
+  /**
+   * Attach a post-hoc summary to an already-completed task. The daemon
+   * fires this after running the task's response through a one-shot LLM
+   * summarizer so the sub-pebble bubble can show a digestible version of
+   * long outputs.
+   */
+  setSummary(taskId: string, summary: string): void {
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    task.summary = summary;
   }
 
   /**
@@ -135,9 +185,12 @@ export class AgentTaskManager {
   }
 
   /**
-   * Remove completed/failed tasks older than maxAge (default 10 min).
+   * Remove completed/failed tasks older than maxAge (default 60 min). The
+   * longer retention lets the ambient sub-pebble surface late task summaries;
+   * the trade-off is more completed records (with result/summary strings) held
+   * in the map at steady state.
    */
-  cleanup(maxAgeMs = 10 * 60_000): number {
+  cleanup(maxAgeMs = 60 * 60_000): number {
     let removed = 0;
     const now = Date.now();
     for (const [id, task] of this.tasks) {

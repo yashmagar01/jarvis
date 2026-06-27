@@ -9,6 +9,103 @@ export type ActionCategory =
   | 'access_browser' | 'control_app';
 
 /**
+ * High-level impact classification used by the dashboard ApprovalCard.
+ * Mirrors the VOICE_SCHEMA.md contract from the v2 redesign.
+ *   read        — observes state, no side effects
+ *   write       — mutates local state (files, DB, agents, messages)
+ *   external    — reaches off-device (email, browser navigation)
+ *   destructive — irreversible or costly (delete, payment, install, terminate, exec)
+ */
+export type Impact = 'read' | 'write' | 'external' | 'destructive';
+
+export const IMPACT_MAP: Record<ActionCategory, Impact> = {
+  read_data:        'read',
+  write_data:       'write',
+  send_message:     'write',
+  spawn_agent:      'write',
+  control_app:      'write',
+  access_browser:   'external',
+  send_email:       'external',
+  execute_command:  'destructive',
+  install_software: 'destructive',
+  make_payment:     'destructive',
+  modify_settings:  'destructive',
+  delete_data:      'destructive',
+  terminate_agent:  'destructive',
+};
+
+export function impactFromCategory(category: ActionCategory): Impact {
+  return IMPACT_MAP[category];
+}
+
+/**
+ * Minimum classifier confidence required to resolve a non-destructive
+ * approval by voice. Below this, we ask the user to repeat or click.
+ *
+ * 0.85 sits above STT's typical "noisy environment" output (~0.6–0.8) but
+ * below confident clean-input output (~0.9+). Tunable; raise if voice
+ * approvals are misfiring, lower if confident "yes"es are being rejected.
+ */
+export const VOICE_APPROVAL_CONFIDENCE_FLOOR = 0.85;
+
+/**
+ * Outcome of evaluating whether a voice "approve/cancel" should resolve a
+ * pending approval, refuse it (clarify), or fall through.
+ *
+ *   resolve  — confidence is high enough and the action is safe enough
+ *              for voice resolution; proceed with approve/deny.
+ *   clarify  — voice resolution refused; emit a clarifier card asking
+ *              the user to either repeat (low confidence) or click
+ *              (destructive impact). The pending approval STAYS in the
+ *              queue and can be resolved via the dashboard.
+ */
+export type VoiceApprovalGateOutcome =
+  | { kind: 'resolve' }
+  | { kind: 'clarify'; reason: 'destructive_impact' | 'low_confidence'; message: string };
+
+/**
+ * Pure decision: should a voice approve/cancel be allowed to resolve an
+ * approval with the given category and STT confidence?
+ *
+ * Two-tier safety net:
+ *   1. Destructive impacts (make_payment, delete_data, terminate_agent,
+ *      execute_command, install_software, modify_settings) NEVER resolve
+ *      by voice. A single misheard syllable could trigger a payment;
+ *      the dashboard click is the only authoritative path.
+ *   2. Non-destructive impacts require confidence ≥ 0.85. STT mishears,
+ *      podcasts, third parties saying "yes" all hit this gate.
+ *
+ * Returning `clarify` is intentionally not the same as falling through —
+ * the caller emits a clarifier card so the user knows the spoken
+ * resolution was heard but suppressed (instead of the resolution silently
+ * doing nothing).
+ *
+ * Exported for unit testing; this is the regression boundary for the
+ * "voice approves a destructive action by misheard 'yes'" failure mode.
+ */
+export function gateVoiceApprovalResolution(
+  category: ActionCategory,
+  confidence: number,
+): VoiceApprovalGateOutcome {
+  const impact = IMPACT_MAP[category];
+  if (impact === 'destructive') {
+    return {
+      kind: 'clarify',
+      reason: 'destructive_impact',
+      message: 'This action requires dashboard confirmation. Please click the approval card.',
+    };
+  }
+  if (confidence < VOICE_APPROVAL_CONFIDENCE_FLOOR) {
+    return {
+      kind: 'clarify',
+      reason: 'low_confidence',
+      message: "Couldn't confirm clearly. Please repeat, or click the approval card.",
+    };
+  }
+  return { kind: 'resolve' };
+}
+
+/**
  * Maps action categories to minimum required authority level
  *
  * Authority levels:
